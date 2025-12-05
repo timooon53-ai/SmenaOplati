@@ -47,7 +47,14 @@ PROXY_FILE: Final = "proxy.txt"
     ASK_THREADS,
     ASK_TOTAL_REQUESTS,
     ASK_LOG_SESSION_ID,
-) = range(9)
+    ASK_TRIP_VALUE,
+    ASK_STREAM_TOKEN,
+    ASK_STREAM_ORDERID,
+    ASK_STREAM_CARD,
+    ASK_STREAM_ID,
+    ASK_STREAM_THREADS,
+    ASK_STREAM_TOTAL,
+) = range(16)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -298,6 +305,21 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trip_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER NOT NULL,
+            token2 TEXT,
+            trip_id TEXT,
+            card TEXT,
+            orderid TEXT,
+            trip_link TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -370,6 +392,80 @@ def get_saved_card_for_user(tg_id: int) -> Optional[str]:
     if row:
         return row[0]
     return None
+
+
+def create_trip_template(tg_id: int) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO trip_templates (tg_id) VALUES (?);
+        """,
+        (tg_id,),
+    )
+    trip_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return trip_id
+
+
+def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, token2, trip_id, card, orderid, trip_link
+        FROM trip_templates
+        WHERE id = ? AND tg_id = ?
+        LIMIT 1;
+        """,
+        (trip_id, tg_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link"]
+        return dict(zip(keys, row))
+    return None
+
+
+def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str) -> None:
+    if field not in {"token2", "trip_id", "card", "orderid", "trip_link"}:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"UPDATE trip_templates SET {field} = ? WHERE id = ? AND tg_id = ?;",
+        (value, trip_id, tg_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_trip_templates(tg_id: int) -> List[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, token2, trip_id, card, orderid, trip_link, created_at
+        FROM trip_templates
+        WHERE tg_id = ?
+        ORDER BY id DESC;
+        """,
+        (tg_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link", "created_at"]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def delete_trip_template(trip_id: int, tg_id: int) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM trip_templates WHERE id = ? AND tg_id = ?;", (trip_id, tg_id))
+    conn.commit()
+    conn.close()
 
 
 def export_session_logs_to_file(tg_id: int, session_id: str) -> Optional[str]:
@@ -456,14 +552,394 @@ async def do_single_request_and_log(
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-        ["Заебашить", "Сменить оплату"],
-        ["Поставить потоки", "Профиль"],
-        ["Запомнить карту", "Прокси вкл/выкл"],
-        ["Посмотреть логи", "Логи последней сессии"],
-        ["Перезагрузить прокси", "Остановить блядство"],
-    ],
-    resize_keyboard=True,
-)
+            ["Заебашить", "Сменить оплату"],
+            ["Запустить потоки", "Профиль"],
+            ["Запомнить карту", "Загрузить поездки"],
+            ["Посмотреть логи", "Логи последней сессии"],
+            ["Перезагрузить прокси", "Прокси вкл/выкл"],
+            ["Остановить блядство"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def _field_icon(value: Optional[str]) -> str:
+    return "✅" if value else "⬜"
+
+
+def ensure_active_trip_record(tg_id: int, context: ContextTypes.DEFAULT_TYPE) -> dict:
+    trip_id = context.user_data.get("active_trip_id")
+    record = None
+    if trip_id:
+        record = get_trip_template(trip_id, tg_id)
+
+    if record is None:
+        trip_id = create_trip_template(tg_id)
+        context.user_data["active_trip_id"] = trip_id
+        record = get_trip_template(trip_id, tg_id) or {}
+
+    return record
+
+
+def trip_form_markup(record: dict) -> InlineKeyboardMarkup:
+    trip_id = record.get("id")
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"{_field_icon(record.get('token2'))} token2",
+                callback_data=f"tripfield:{trip_id}:token2",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{_field_icon(record.get('trip_id'))} ID",
+                callback_data=f"tripfield:{trip_id}:trip_id",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{_field_icon(record.get('card'))} card-x",
+                callback_data=f"tripfield:{trip_id}:card",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{_field_icon(record.get('orderid'))} orderid",
+                callback_data=f"tripfield:{trip_id}:orderid",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{_field_icon(record.get('trip_link'))} ссылка на поездку",
+                callback_data=f"tripfield:{trip_id}:trip_link",
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+async def show_trip_loader(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    tg_id = user.id if user else None
+
+    if tg_id is None:
+        await update.message.reply_text(
+            "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    record = ensure_active_trip_record(tg_id, context)
+    text = (
+        "Загрузи поездку. Нажми на нужный параметр, введи данные, и они сразу"
+        " запишутся в БД."
+    )
+    await update.message.reply_text(
+        text,
+        reply_markup=trip_form_markup(record),
+    )
+    return MENU
+
+
+async def tripfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, trip_id_str, field = query.data.split(":", 2)
+        trip_id = int(trip_id_str)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text("Не понял, какую ячейку нужно заполнить.")
+        return MENU
+
+    context.user_data["pending_trip_input"] = {
+        "trip_id": trip_id,
+        "field": field,
+    }
+
+    field_names = {
+        "token2": "token2",
+        "trip_id": "ID",
+        "card": "card-x",
+        "orderid": "orderid",
+        "trip_link": "ссылку на поездку",
+    }
+    await query.message.reply_text(
+        f"Введи {field_names.get(field, 'значение')} для этой поездки:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ASK_TRIP_VALUE
+
+
+async def trip_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    tg_id = user.id if user else None
+    pending = context.user_data.get("pending_trip_input")
+
+    if tg_id is None or not isinstance(pending, dict):
+        await update.message.reply_text(
+            "Не нашёл активный слот для сохранения. Нажми «Загрузить поездки» снова.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    trip_id = int(pending.get("trip_id", 0))
+    field = pending.get("field")
+    value = update.message.text.strip()
+
+    update_trip_template_field(trip_id, tg_id, field, value)
+    context.user_data.pop("pending_trip_input", None)
+    context.user_data["active_trip_id"] = trip_id
+
+    record = get_trip_template(trip_id, tg_id) or {}
+    await update.message.reply_text(
+        "Сохранил ✅ Данные записаны в таблицу.",
+        reply_markup=trip_form_markup(record),
+    )
+    return MENU
+
+
+def stream_start_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Выбрать из уже созданных", callback_data="streams:choose")],
+            [InlineKeyboardButton("Создать своё", callback_data="streams:create")],
+        ]
+    )
+
+
+async def send_trip_templates_list(
+    chat, tg_id: int, context: ContextTypes.DEFAULT_TYPE
+):
+    templates = list_trip_templates(tg_id)
+    if not templates:
+        await chat.reply_text(
+            "Нет сохранённых поездок. Сначала нажми «Загрузить поездки» и заполни поля.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"#{t['id']} | {t.get('orderid') or 'orderid не задан'}",
+                callback_data=f"tripselect:{t['id']}",
+            )
+        ]
+        for t in templates
+    ]
+
+    await chat.reply_text(
+        "Выбери одну из сохранённых поездок:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "create":
+        context.user_data["stream_config"] = {}
+        await query.message.reply_text(
+            "Создаём новый набор данных для потоков. Введи token2:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_STREAM_TOKEN
+
+    if choice == "choose":
+        user = update.effective_user
+        tg_id = user.id if user else None
+        if tg_id is None:
+            await query.message.reply_text(
+                "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+            )
+            return MENU
+
+        await send_trip_templates_list(query.message, tg_id, context)
+        return MENU
+
+    await query.message.reply_text("Непонятный выбор.", reply_markup=main_keyboard())
+    return MENU
+
+
+async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, trip_id_str = query.data.split(":", 1)
+        trip_id = int(trip_id_str)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text("Не понял, что открыть.")
+        return MENU
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    record = get_trip_template(trip_id, tg_id or 0) if tg_id else None
+
+    if not record:
+        await query.message.reply_text("Не нашёл такую запись в БД.")
+        return MENU
+
+    text_lines = [
+        f"ID записи: {record['id']}",
+        f"token2: {record.get('token2') or '—'}",
+        f"ID: {record.get('trip_id') or '—'}",
+        f"card-x: {record.get('card') or '—'}",
+        f"orderid: {record.get('orderid') or '—'}",
+        f"Ссылка: {record.get('trip_link') or '—'}",
+    ]
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Использовать в смене", callback_data=f"tripuse:{record['id']}"
+                ),
+                InlineKeyboardButton(
+                    "Удалить из БД", callback_data=f"tripdelete:{record['id']}"
+                ),
+            ]
+        ]
+    )
+
+    await query.message.reply_text("\n".join(text_lines), reply_markup=keyboard)
+    return MENU
+
+
+async def trip_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, trip_id_str = query.data.split(":", 1)
+        trip_id = int(trip_id_str)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text("Не понял, что удалить.")
+        return MENU
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.message.reply_text("Не смог получить TG ID.")
+        return MENU
+
+    delete_trip_template(trip_id, tg_id)
+    await query.message.reply_text("Удалил запись из БД.", reply_markup=main_keyboard())
+    return MENU
+
+
+async def trip_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, trip_id_str = query.data.split(":", 1)
+        trip_id = int(trip_id_str)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text("Не понял, что использовать.")
+        return MENU
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    record = get_trip_template(trip_id, tg_id or 0) if tg_id else None
+    if not record:
+        await query.message.reply_text("Не нашёл запись.")
+        return MENU
+
+    context.user_data["token"] = record.get("token2")
+    context.user_data["orderid"] = record.get("orderid")
+    context.user_data["card"] = record.get("card")
+    context.user_data["id"] = record.get("trip_id")
+
+    await query.message.reply_text(
+        "Данные перенесены в смену. Сколько потоков запустить?",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ASK_THREADS
+
+
+async def stream_token_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token = update.message.text.strip()
+    context.user_data.setdefault("stream_config", {})["token"] = token
+    await update.message.reply_text(
+        "Принял token2. Теперь введи orderid:", reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_STREAM_ORDERID
+
+
+async def stream_orderid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    orderid = update.message.text.strip()
+    context.user_data.setdefault("stream_config", {})["orderid"] = orderid
+    await update.message.reply_text(
+        "Теперь card-x:", reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_STREAM_CARD
+
+
+async def stream_card_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    card = update.message.text.strip()
+    context.user_data.setdefault("stream_config", {})["card"] = card
+    await update.message.reply_text(
+        "Введи ID:", reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_STREAM_ID
+
+
+async def stream_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip()
+    context.user_data.setdefault("stream_config", {})["id"] = val
+    await update.message.reply_text(
+        "Сколько потоков запустить?", reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_STREAM_THREADS
+
+
+async def stream_threads_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        threads = int(text)
+        if threads <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Нужно целое положительное число потоков.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    context.user_data.setdefault("stream_config", {})["threads"] = threads
+    await update.message.reply_text(
+        "Сколько всего запросов сделать?", reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_STREAM_TOTAL
+
+
+async def stream_total_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        total_requests = int(text)
+        if total_requests <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Нужно целое положительное число запросов.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    config = context.user_data.get("stream_config", {})
+    required = [config.get("token"), config.get("orderid"), config.get("card"), config.get("id")]
+    if not all(required):
+        await update.message.reply_text(
+            "Не все данные заданы. Попробуй снова через «Запустить потоки».",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+    context.user_data["token"] = config.get("token")
+    context.user_data["orderid"] = config.get("orderid")
+    context.user_data["card"] = config.get("card")
+    context.user_data["id"] = config.get("id")
+
+    threads = config.get("threads", 1)
+    context.user_data["threads"] = threads
+    await bulk_change_payment(update, context, threads, total_requests)
+    return MENU
 
 
 
@@ -508,7 +984,7 @@ async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if choice == "bulk":
         await query.message.reply_text(
             "Выбрал массовый запуск. Сначала введи параметры через «Заебашить»,"
-            " а потом нажми «Поставить потоки».",
+            " а потом нажми «Запустить потоки».",
             reply_markup=main_keyboard(),
         )
         return MENU
@@ -569,7 +1045,7 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Все параметры сохранены ✅\n\n"
         "Теперь ты можешь:\n"
         "• «Сменить оплату» — один POST-запрос.\n"
-        "• «Поставить потоки» — массовая отправка.\n"
+        "• «Запустить потоки» — массовая отправка.\n"
         "• «Профиль» — статистика.\n"
         "• «Запомнить карту» — сохранить карту.\n"
         "• «Посмотреть логи» или «Логи последней сессии».\n"
@@ -614,12 +1090,14 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return REMEMBER_CARD
 
-    if text == "Поставить потоки":
+    if text == "Запустить потоки":
         await update.message.reply_text(
-            "Введи количество потоков (одновременных запросов, целое число):",
-            reply_markup=ReplyKeyboardRemove(),
+            "Выбери, как запускать потоки:", reply_markup=stream_start_markup()
         )
-        return ASK_THREADS
+        return MENU
+
+    if text == "Загрузить поездки":
+        return await show_trip_loader(update, context)
 
     if text == "Посмотреть логи":
         await update.message.reply_text(
@@ -1142,8 +1620,13 @@ def main():
             ASK_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_card)],
             ASK_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_id)],
             MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
+                CallbackQueryHandler(tripfield_callback, pattern="^tripfield:"),
+                CallbackQueryHandler(streams_option_callback, pattern="^streams:"),
+                CallbackQueryHandler(trip_select_callback, pattern="^tripselect:"),
+                CallbackQueryHandler(trip_delete_callback, pattern="^tripdelete:"),
+                CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
                 CallbackQueryHandler(start_choice_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
             ],
             REMEMBER_CARD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, remember_card_handler)
@@ -1158,6 +1641,27 @@ def main():
             ],
             ASK_LOG_SESSION_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_log_session_handler)
+            ],
+            ASK_TRIP_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, trip_value_handler)
+            ],
+            ASK_STREAM_TOKEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stream_token_handler)
+            ],
+            ASK_STREAM_ORDERID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stream_orderid_handler)
+            ],
+            ASK_STREAM_CARD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stream_card_handler)
+            ],
+            ASK_STREAM_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stream_id_handler)
+            ],
+            ASK_STREAM_THREADS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stream_threads_handler)
+            ],
+            ASK_STREAM_TOTAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stream_total_handler)
             ],
         },
         fallbacks=[
