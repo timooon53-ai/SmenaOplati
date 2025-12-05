@@ -6,13 +6,22 @@ import random
 import tempfile
 import os
 import threading
-from typing import Final, Optional, Tuple, List
+import html
+from typing import Final, Optional, Tuple, List, Callable, Awaitable
 
-import requests
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputFile
+import aiohttp
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
     ContextTypes,
@@ -36,7 +45,7 @@ PROXY_FILE: Final = "proxy.txt"
     MENU,
     REMEMBER_CARD,
     ASK_THREADS,
-    ASK_SECONDS,
+    ASK_TOTAL_REQUESTS,
     ASK_LOG_SESSION_ID,
 ) = range(9)
 
@@ -51,6 +60,162 @@ logger = logging.getLogger(__name__)
 PROXIES: List[str] = []
 _proxy_cycle = None
 _proxy_lock = threading.Lock()
+
+
+class ChangePaymentClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.proxy_pool: List[str] = []
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._proxy_index = 0
+
+    async def start(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+
+    async def close(self):
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    def update_proxies(self, proxies: List[str]):
+        self.proxy_pool = proxies
+        self._proxy_index = 0
+
+    def _next_proxy(self) -> Optional[str]:
+        if not self.proxy_pool:
+            return None
+        proxy = self.proxy_pool[self._proxy_index]
+        self._proxy_index = (self._proxy_index + 1) % len(self.proxy_pool)
+        return proxy
+
+    async def send_change_payment(
+        self,
+        headers: dict,
+        payload: dict,
+        use_proxies: bool,
+        max_proxy_attempts: int = 3,
+        timeout: float = 15.0,
+    ) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
+        assert self._session is not None, "Сначала вызови start()"
+
+        attempts = max_proxy_attempts if (use_proxies and self.proxy_pool) else 1
+        last_exc = None
+        used_proxy = None
+
+        for _ in range(attempts):
+            proxy = self._next_proxy() if use_proxies and self.proxy_pool else None
+            used_proxy = proxy
+
+            try:
+                async with self._session.post(
+                    self.base_url,
+                    json=payload,
+                    headers=headers,
+                    proxy=proxy,
+                    timeout=timeout,
+                ) as resp:
+                    text = await resp.text()
+                    return True, resp.status, text, proxy
+            except Exception as e:  # noqa: BLE001
+                last_exc = str(e)
+
+        return False, None, last_exc, used_proxy
+
+
+class SessionService:
+    def __init__(self, client: ChangePaymentClient):
+        self.client = client
+
+    async def send_one(
+        self,
+        tg_id: int,
+        headers: dict,
+        payload: dict,
+        session_id: str,
+        use_proxies: bool,
+        max_attempts: int = 3,
+    ) -> Tuple[bool, Optional[int], Optional[str]]:
+        await self.client.start()
+
+        for attempt in range(1, max_attempts + 1):
+            ok, status_code, response_text, used_proxy = await self.client.send_change_payment(
+                headers, payload, use_proxies
+            )
+
+            if ok and status_code is not None and 200 <= status_code < 300:
+                break
+
+            if status_code in {429} or (status_code is not None and status_code >= 500):
+                backoff = min(2 ** attempt * 0.5, 10)
+                jitter = random.uniform(0, 0.5)
+                await asyncio.sleep(backoff + jitter)
+            else:
+                break
+
+        enriched_body = dict(payload)
+        if used_proxy:
+            enriched_body["_used_proxy"] = used_proxy
+
+        log_request_to_db(
+            tg_id=tg_id,
+            url=CHANGE_PAYMENT_URL,
+            headers=headers,
+            body=enriched_body,
+            status_code=status_code,
+            response_body=response_text,
+            session_id=session_id,
+        )
+
+        return ok, status_code, response_text
+
+    async def run_bulk(
+        self,
+        tg_id: int,
+        headers: dict,
+        payload: dict,
+        use_proxies: bool,
+        total_requests: int,
+        concurrency: int,
+        session_id: str,
+        progress_cb: Optional[
+            Callable[[int, int, int, Optional[str]], Awaitable[None]]
+        ] = None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> Tuple[int, int]:
+        await self.client.start()
+        stop_event = stop_event or asyncio.Event()
+
+        completed = 0
+        success = 0
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _job(idx: int):
+            nonlocal completed, success
+            async with semaphore:
+                if stop_event.is_set():
+                    return
+
+                ok, status_code, response_text = await self.send_one(
+                    tg_id, headers, payload, session_id, use_proxies
+                )
+
+                completed += 1
+                if ok and status_code is not None and 200 <= status_code < 300:
+                    success += 1
+
+                if progress_cb:
+                    await progress_cb(completed, success, status_code or 0, response_text)
+
+                await asyncio.sleep(0.3)
+
+        tasks = [asyncio.create_task(_job(i)) for i in range(total_requests)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return completed, success
+
+
+http_client = ChangePaymentClient(CHANGE_PAYMENT_URL)
+session_service = SessionService(http_client)
 
 
 def load_proxies():
@@ -78,6 +243,8 @@ def load_proxies():
     else:
         _proxy_cycle = None
         logger.warning("proxy.txt пустой, работа без прокси.")
+
+    http_client.update_proxies(PROXIES)
 
 
 def get_next_proxy() -> Optional[str]:
@@ -274,117 +441,29 @@ def generate_session_id() -> str:
     return str(random.randint(10_000, 9_999_999))
 
 
-def send_with_proxies(
-    headers: dict,
-    payload: dict,
-) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
-    """
-    Логический запрос с использованием списка прокси.
-    - Берём следующую прокси;
-    - если не работает — берём следующую;
-    - на один логический запрос каждую прокси пробуем не более 1 раза;
-    - если прокси нет или все умерли — возвращаем ошибку.
-    Возвращает (ok, status_code, response_text, used_proxy).
-    """
-    last_exception_text = None
-
-    if not PROXIES:
-        return False, None, "Нет прокси в списке.", None
-
-    max_attempts = len(PROXIES)
-    for _ in range(max_attempts):
-        proxy = get_next_proxy()
-        if not proxy:
-            break
-
-        proxies_dict = {
-            "http": proxy,
-            "https": proxy,
-        }
-
-        try:
-            resp = requests.post(
-                CHANGE_PAYMENT_URL,
-                headers=headers,
-                json=payload,
-                timeout=15,
-                proxies=proxies_dict,
-            )
-            return True, resp.status_code, resp.text, proxy
-        except requests.RequestException as e:
-            last_exception_text = f"Proxy {proxy} error: {e}"
-            logger.warning("Ошибка прокси %s: %s", proxy, e)
-
-    return False, None, last_exception_text, None
-
-
-def do_single_request_and_log(
+async def do_single_request_and_log(
     tg_id: int,
     headers: dict,
     payload: dict,
     session_id: str,
     use_proxies: bool,
 ) -> Tuple[bool, Optional[int], Optional[str]]:
-    """
-    Один логический запрос:
-    - либо через прокси (если use_proxies=True и список не пуст),
-    - либо напрямую.
-    Логирование в БД.
-    """
-    used_proxy = None
-    status_code = None
-    response_text = None
-    ok = False
-
-    if use_proxies and PROXIES:
-        ok, status_code, response_text, used_proxy = send_with_proxies(headers, payload)
-    else:
-        try:
-            resp = requests.post(
-                CHANGE_PAYMENT_URL,
-                headers=headers,
-                json=payload,
-                timeout=15,
-            )
-            status_code = resp.status_code
-            response_text = resp.text
-            ok = True
-        except requests.RequestException as e:
-            response_text = str(e)
-            ok = False
-
-
-    try:
-        enriched_body = dict(payload)
-        if used_proxy:
-            enriched_body["_used_proxy"] = used_proxy
-
-        log_request_to_db(
-            tg_id=tg_id,
-            url=CHANGE_PAYMENT_URL,
-            headers=headers,
-            body=enriched_body,
-            status_code=status_code,
-            response_body=response_text,
-            session_id=session_id,
-        )
-    except Exception as e:
-        logger.exception("Ошибка при логировании запроса в БД: %s", e)
-
-    return ok, status_code, response_text
+    return await session_service.send_one(
+        tg_id, headers, payload, session_id, use_proxies
+    )
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["Заебашить", "Сменить оплату"],
-            ["Поставить потоки", "Профиль"],
-            ["Запомнить карту", "Прокси вкл/выкл"],
-            ["Посмотреть логи", "Логи последней сессии"],
-            ["Остановить блядство"],
-        ],
-        resize_keyboard=True,
-    )
+        ["Заебашить", "Сменить оплату"],
+        ["Поставить потоки", "Профиль"],
+        ["Запомнить карту", "Прокси вкл/выкл"],
+        ["Посмотреть логи", "Логи последней сессии"],
+        ["Перезагрузить прокси", "Остановить блядство"],
+    ],
+    resize_keyboard=True,
+)
 
 
 
@@ -401,8 +480,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Нажми «Заебашить», чтобы начать вводить данные и слать запросы.\n"
         "Можешь предварительно включить/выключить прокси кнопкой «Прокси вкл/выкл».\n\n"
         f"Текущее состояние прокси: {proxy_state}",
-        reply_markup=main_keyboard(),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Одиночный запуск", callback_data="single"),
+                    InlineKeyboardButton("Массовый запуск", callback_data="bulk"),
+                ]
+            ]
+        ),
     )
+    return MENU
+
+
+async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+
+    if choice == "single":
+        await query.message.reply_text(
+            "Окей, погнали. 🚀\n"
+            "Сначала отправь токен (только сам <token>, без Bearer):",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_TOKEN
+
+    if choice == "bulk":
+        await query.message.reply_text(
+            "Выбрал массовый запуск. Сначала введи параметры через «Заебашить»,"
+            " а потом нажми «Поставить потоки».",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    await query.message.reply_text("Неизвестный выбор.", reply_markup=main_keyboard())
     return MENU
 
 
@@ -531,13 +642,27 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MENU
 
+    if text == "Перезагрузить прокси":
+        load_proxies()
+        use_proxies = context.user_data.get("use_proxies", True)
+        state = "ВКЛ" if use_proxies and PROXIES else "ВЫКЛ (или список пуст)"
+        await update.message.reply_text(
+            f"Прокси перечитаны. Текущее состояние: {state}",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
     if text == "Остановить блядство":
         stop_event: Optional[asyncio.Event] = context.user_data.get("stop_event")
+        progress = context.user_data.get("active_session", {}).get("progress")
         if isinstance(stop_event, asyncio.Event) and not stop_event.is_set():
             stop_event.set()
+            completed = progress.get("completed", 0) if isinstance(progress, dict) else 0
+            success = progress.get("success", 0) if isinstance(progress, dict) else 0
+            failed = max(completed - success, 0)
             await update.message.reply_text(
                 "Окей, останавливаю блядство. ⛔ "
-                "Текущие запросы дойдут до конца, новые запускаться не будут.",
+                f"Уже отправлено: {completed}. Успехов: {success}. Неуспехов: {failed}.",
                 reply_markup=main_keyboard(),
             )
         else:
@@ -574,14 +699,14 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if saved_card:
         msg = (
             f"👤 Профиль\n\n"
-            f"TG ID: <code>{tg_id}</code>\n"
+            f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
             f"Всего отправлено запросов: <b>{total_requests}</b>\n"
-            f"Запомненная карта: <code>{saved_card}</code>\n"
+            f"Запомненная карта: <code>{html.escape(saved_card)}</code>\n"
         )
     else:
         msg = (
             f"👤 Профиль\n\n"
-            f"TG ID: <code>{tg_id}</code>\n"
+            f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
             f"Всего отправлено запросов: <b>{total_requests}</b>\n"
             f"Запомненная карта: не сохранена\n"
         )
@@ -589,7 +714,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"\nПрокси: {proxy_state}\n"
 
     if last_session_id:
-        msg += f"\nПоследний ID сессии: <code>{last_session_id}</code>\n"
+        msg += f"\nПоследний ID сессии: <code>{html.escape(str(last_session_id))}</code>\n"
 
     msg += "\nКнопка «Логи последней сессии» сразу скинет .txt по последней сессии."
 
@@ -617,7 +742,7 @@ async def remember_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["card"] = card
 
     await update.message.reply_text(
-        f"Карта <code>{card}</code> сохранена ✅\n"
+        f"Карта <code>{html.escape(card)}</code> сохранена ✅\n"
         f"Теперь она будет автоматически подставляться в запросы.\n"
         f"Если захочешь её поменять — снова нажми «Запомнить карту».",
         parse_mode="HTML",
@@ -634,28 +759,32 @@ async def ask_threads_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "Нужно целое положительное число потоков. Попробуй ещё раз:"
+            "Нужно целое положительное число потоков."
+            " Можешь снова ввести число или нажать любую кнопку меню.",
+            reply_markup=main_keyboard(),
         )
-        return ASK_THREADS
+        return MENU
 
     context.user_data["threads"] = threads
     await update.message.reply_text(
-        "Ок. Теперь введи количество секунд, в течение которых слать запросы:"
+        "Ок. Сколько всего запросов нужно отправить?",
     )
-    return ASK_SECONDS
+    return ASK_TOTAL_REQUESTS
 
 
-async def ask_seconds_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_total_requests_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
-        seconds = int(text)
-        if seconds <= 0:
+        total_requests = int(text)
+        if total_requests <= 0:
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "Нужно целое положительное количество секунд. Попробуй ещё раз:"
+            "Нужно целое положительное число запросов."
+            " Можешь снова ввести число или нажать любую кнопку меню.",
+            reply_markup=main_keyboard(),
         )
-        return ASK_SECONDS
+        return MENU
 
     threads = context.user_data.get("threads")
     if not threads:
@@ -665,7 +794,7 @@ async def ask_seconds_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return MENU
 
-    await bulk_change_payment(update, context, threads, seconds)
+    await bulk_change_payment(update, context, threads, total_requests)
     return MENU
 
 
@@ -803,18 +932,18 @@ async def change_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     headers = build_headers(user_token)
     payload = build_payload(orderid, card, _id)
 
-    loop = asyncio.get_running_loop()
-    ok, status_code, response_text = await loop.run_in_executor(
-        None, do_single_request_and_log, tg_id, headers, payload, session_id, use_proxies
+    ok, status_code, response_text = await do_single_request_and_log(
+        tg_id, headers, payload, session_id, use_proxies
     )
 
     if response_text is None:
         response_text = ""
 
     max_len = 1500
-    body_text = response_text[:max_len] + (
+    sliced_response = response_text[:max_len] + (
         "\n\n[ответ обрезан]" if len(response_text) > max_len else ""
     )
+    body_text = html.escape(sliced_response)
 
     if ok:
         msg = (
@@ -843,19 +972,26 @@ async def bulk_change_payment(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     threads: int,
-    seconds: int,
+    total_requests: int,
 ):
     """
-    Массовая отправка: threads — максимум одновременных логических запросов,
-    seconds — "длительность", всего логических запросов = threads * seconds.
-    Одна общая session_id.
-    Можно остановить по кнопке «Остановить блядство»:
-    - новые запросы не стартуют,
-    - текущие (максимум = threads) добегают и всё.
+    Массовая отправка: threads — одновременные запросы,
+    total_requests — сколько всего логических запросов сделать.
+    Добавлена честная задержка 300 мс между запросами, бэкофф на 429/5xx и
+    корректная остановка.
     """
     user = update.effective_user
     tg_id = user.id if user else 0
     chat_id = update.effective_chat.id
+
+    active_stop: Optional[asyncio.Event] = context.user_data.get("stop_event")
+    if isinstance(active_stop, asyncio.Event) and not active_stop.is_set():
+        await update.message.reply_text(
+            "У тебя уже идёт массовая отправка. Дождись окончания или нажми"
+            " «Остановить блядство».",
+            reply_markup=main_keyboard(),
+        )
+        return
 
     user_token = context.user_data.get("token")
     orderid = context.user_data.get("orderid")
@@ -882,7 +1018,6 @@ async def bulk_change_payment(
     headers = build_headers(user_token)
     payload = build_payload(orderid, card, _id)
 
-    total_requests = threads * seconds
     session_id = generate_session_id()
     context.user_data["last_session_id"] = session_id
 
@@ -890,21 +1025,13 @@ async def bulk_change_payment(
         f"Запускаю массовую отправку.\n"
         f"ID сессии: <code>{session_id}</code>\n"
         f"Потоки (одновременных запросов): {threads}\n"
-        f"Условное время: {seconds} сек\n"
-        f"Всего логических запросов: ~{total_requests}\n"
+        f"Всего логических запросов: {total_requests}\n"
         f"Прокси: {proxy_state}\n\n"
         f"Каждые 5 секунд буду присылать лог (headers, body, последний ответ).\n"
         f"Чтобы остановить — нажми «Остановить блядство».",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
-
-    loop = asyncio.get_running_loop()
-
-    # Очередь задач и прогресс
-    queue: asyncio.Queue[int] = asyncio.Queue()
-    for i in range(total_requests):
-        queue.put_nowait(i)
 
     progress = {
         "completed": 0,
@@ -913,111 +1040,81 @@ async def bulk_change_payment(
         "last_response": "",
     }
 
-    # stop_event будет выставляться по кнопке «Остановить блядство»
     stop_event = asyncio.Event()
     context.user_data["stop_event"] = stop_event
+    context.user_data["active_session"] = {
+        "session_id": session_id,
+        "progress": progress,
+    }
 
-    async def worker(name: int):
-        """
-        Воркер: берёт job из очереди, пока:
-        - очередь не кончилась, и
-        - не нажали «Остановить блядство».
-        """
-        while not stop_event.is_set():
-            try:
-                _ = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break  # работы больше нет
-
-            if stop_event.is_set():
-                queue.task_done()
-                break
-
-            ok, status_code, response_text = await loop.run_in_executor(
-                None,
-                do_single_request_and_log,
-                tg_id,
-                headers,
-                payload,
-                session_id,
-                use_proxies,
+    async def progress_cb(
+        completed: int, success: int, status: int, response: Optional[str]
+    ):
+        progress["completed"] = completed
+        progress["success"] = success
+        progress["last_status"] = status
+        if response:
+            max_len = 800
+            sliced = response[:max_len] + (
+                "\n\n[ответ обрезан]" if len(response) > max_len else ""
             )
-
-            progress["completed"] += 1
-            if ok:
-                progress["success"] += 1
-            progress["last_status"] = status_code
-            if response_text:
-                max_len = 800
-                progress["last_response"] = (
-                    response_text[:max_len]
-                    + ("\n\n[ответ обрезан]" if len(response_text) > max_len else "")
-                )
-
-            queue.task_done()
-
-            # ещё раз проверим, не пришёл ли стоп после выполнения запроса
-            if stop_event.is_set():
-                break
+            progress["last_response"] = html.escape(sliced)
 
     async def reporter():
-        """
-        Каждые 5 секунд шлём промежуточный лог, пока:
-        - не отработал стоп,
-        - и пока идёт работа.
-        """
         while not stop_event.is_set():
             await asyncio.sleep(5)
             if stop_event.is_set():
                 break
 
+            msg = (
+                f"📊 Промежуточный лог\n"
+                f"ID сессии: <code>{session_id}</code>\n"
+                f"Выполнено логических запросов: {progress['completed']} из {total_requests}\n"
+                f"Успешных: {progress['success']}\n"
+                f"Последний статус: {progress['last_status']}\n"
+                f"Прокси: {proxy_state}\n\n"
+                f"<b>Headers</b>:\n<pre>{html.escape(json.dumps(headers, ensure_ascii=False, indent=2))}</pre>\n"
+                f"<b>Body</b>:\n<pre>{html.escape(json.dumps(payload, ensure_ascii=False, indent=2))}</pre>\n"
+                f"<b>Последний ответ</b>:\n<pre>{progress['last_response']}</pre>"
+            )
             try:
-                msg = (
-                    f"📊 Промежуточный лог\n"
-                    f"ID сессии: <code>{session_id}</code>\n"
-                    f"Выполнено логических запросов: {progress['completed']} из ~{total_requests}\n"
-                    f"Успешных: {progress['success']}\n"
-                    f"Последний статус: {progress['last_status']}\n"
-                    f"Прокси: {proxy_state}\n\n"
-                    f"<b>Headers</b>:\n<pre>{json.dumps(headers, ensure_ascii=False, indent=2)}</pre>\n"
-                    f"<b>Body</b>:\n<pre>{json.dumps(payload, ensure_ascii=False, indent=2)}</pre>\n"
-                    f"<b>Последний ответ</b>:\n<pre>{progress['last_response']}</pre>"
-                )
                 await context.bot.send_message(
                     chat_id=chat_id, text=msg, parse_mode="HTML"
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning("Ошибка отправки репорта: %s", e)
 
-    # Стартуем воркеры (не больше threads, и смысла больше нет)
-    workers = [
-        asyncio.create_task(worker(i))
-        for i in range(min(threads, total_requests))
-    ]
     reporter_task = asyncio.create_task(reporter())
 
-    # Ждём, пока либо всё выполнится, либо ты нажмёшь стоп
-    # когда нажмёшь «Остановить блядство», stop_event.set() вызовется в menu_handler
-    await asyncio.gather(*workers, return_exceptions=True)
+    completed, success = await session_service.run_bulk(
+        tg_id=tg_id,
+        headers=headers,
+        payload=payload,
+        use_proxies=use_proxies,
+        total_requests=total_requests,
+        concurrency=threads,
+        session_id=session_id,
+        progress_cb=progress_cb,
+        stop_event=stop_event,
+    )
 
-    # сигналим репортёру, что всё, хватит
     stop_event.set()
+    context.user_data.pop("stop_event", None)
+    context.user_data.pop("active_session", None)
     try:
         await reporter_task
     except Exception:
         pass
 
-    # очищаем стоп-ивент в user_data
-    context.user_data.pop("stop_event", None)
-
-    success = progress["success"]
-    completed = progress["completed"]
+    failed = completed - success
 
     await update.message.reply_text(
         f"Массовая отправка завершена (или остановлена).\n"
         f"ID сессии: <code>{session_id}</code>\n"
         f"Прокси: {proxy_state}\n"
-        f"Успешных логических запросов: {success} из {completed} (запланировано было ~{total_requests})",
+        f"Успешных логических запросов: {success}\n"
+        f"Неуспешных: {failed}\n"
+        f"Всего попыток: {completed} из запланированных {total_requests}",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -1044,15 +1141,20 @@ def main():
             ASK_ORDERID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_orderid)],
             ASK_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_card)],
             ASK_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_id)],
-            MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler)],
+            MENU: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
+                CallbackQueryHandler(start_choice_callback),
+            ],
             REMEMBER_CARD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, remember_card_handler)
             ],
             ASK_THREADS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_threads_handler)
             ],
-            ASK_SECONDS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_seconds_handler)
+            ASK_TOTAL_REQUESTS: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, ask_total_requests_handler
+                )
             ],
             ASK_LOG_SESSION_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_log_session_handler)
