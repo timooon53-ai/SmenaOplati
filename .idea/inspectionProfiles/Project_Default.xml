@@ -1,0 +1,44 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="anyio" />
+          <option value="certifi" />
+          <option value="cffi" />
+          <option value="charset-normalizer" />
+          <option value="cryptography" />
+          <option value="Deprecated" />
+          <option value="googleapis-common-protos" />
+          <option value="grpcio" />
+          <option value="grpcio-tools" />
+          <option value="h11" />
+          <option value="httpcore" />
+          <option value="httpx" />
+          <option value="idna" />
+          <option value="numpy" />
+          <option value="protobuf" />
+          <option value="pycparser" />
+          <option value="pydub" />
+          <option value="PyJWT" />
+          <option value="PySide6" />
+          <option value="PySide6_Addons" />
+          <option value="PySide6_Essentials" />
+          <option value="python-telegram-bot" />
+          <option value="requests" />
+          <option value="setuptools" />
+          <option value="shiboken6" />
+          <option value="six" />
+          <option value="sniffio" />
+          <option value="sounddevice" />
+          <option value="soundfile" />
+          <option value="typing_extensions" />
+          <option value="urllib3" />
+          <option value="wrapt" />
+          <option value="yandexcloud" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
