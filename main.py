@@ -1212,14 +1212,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Нажми «Заебашить», там выбери «Одиночная смена» или «Запустить потоки».\n"
         "Для управления прокси и поездками жми «Прокси/аккаунты».\n\n"
         f"Текущее состояние прокси: {proxy_state}",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Одиночная смена", callback_data="single"),
-                    InlineKeyboardButton("Запустить потоки", callback_data="bulk"),
-                ]
-            ]
-        ),
+        reply_markup=main_keyboard(),
     )
     return MENU
 
