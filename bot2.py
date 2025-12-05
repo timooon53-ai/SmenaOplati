@@ -480,14 +480,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Нажми «Заебашить», чтобы начать вводить данные и слать запросы.\n"
         "Можешь предварительно включить/выключить прокси кнопкой «Прокси вкл/выкл».\n\n"
         f"Текущее состояние прокси: {proxy_state}",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Одиночный запуск", callback_data="single"),
-                    InlineKeyboardButton("Массовый запуск", callback_data="bulk"),
-                ]
-            ]
-        ),
+        reply_markup=main_keyboard(),
     )
     return MENU
 
