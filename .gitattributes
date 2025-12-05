@@ -1,0 +1,5 @@
+* text=auto
+*.txt text diff
+*.py text diff
+*.md text diff
+*.xml text diff
