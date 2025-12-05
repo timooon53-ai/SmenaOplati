@@ -5,11 +5,13 @@ import asyncio
 import random
 import tempfile
 import os
+import sys
 import threading
 import html
 from typing import Final, Optional, Tuple, List, Callable, Awaitable
 
 import aiohttp
+import cfg
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -28,10 +30,8 @@ from telegram.ext import (
     filters,
 )
 
-from cfg import TOKEN_BOTA
-
-
-BOT_TOKEN: Final = TOKEN_BOTA
+BOT_TOKEN: Final = cfg.TOKEN_BOTA
+ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
 DB_PATH: Final = "bot.db"
@@ -195,29 +195,44 @@ class SessionService:
 
         completed = 0
         success = 0
-        semaphore = asyncio.Semaphore(concurrency)
+        counter_lock = asyncio.Lock()
+        stats_lock = asyncio.Lock()
+        next_idx = 0
 
-        async def _job(idx: int):
-            nonlocal completed, success
-            async with semaphore:
+        async def worker(worker_id: int):
+            nonlocal completed, success, next_idx
+            while True:
                 if stop_event.is_set():
                     return
 
-                ok, status_code, response_text = await self.send_one(
-                    tg_id, headers, payload, session_id, use_proxies
-                )
+                async with counter_lock:
+                    if stop_event.is_set() or next_idx >= total_requests:
+                        return
+                    next_idx += 1
 
-                completed += 1
-                if ok and status_code is not None and 200 <= status_code < 300:
-                    success += 1
+                try:
+                    ok, status_code, response_text = await self.send_one(
+                        tg_id, headers, payload, session_id, use_proxies
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("Ошибка при отправке в потоке %s: %s", worker_id, e)
+                    ok, status_code, response_text = False, None, str(e)
+
+                async with stats_lock:
+                    completed += 1
+                    if ok and status_code is not None and 200 <= status_code < 300:
+                        success += 1
 
                 if progress_cb:
                     await progress_cb(completed, success, status_code or 0, response_text)
 
+                if stop_event.is_set():
+                    return
+
                 await asyncio.sleep(0.3)
 
-        tasks = [asyncio.create_task(_job(i)) for i in range(total_requests)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        workers = [asyncio.create_task(worker(i)) for i in range(max(concurrency, 1))]
+        await asyncio.gather(*workers, return_exceptions=True)
         return completed, success
 
 
@@ -589,6 +604,88 @@ def actions_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+def _collect_progress_snapshot(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int, str, dict]:
+    active_session = context.user_data.get("active_session")
+    progress = active_session.get("progress") if isinstance(active_session, dict) else {}
+    session_id = active_session.get("session_id") if isinstance(active_session, dict) else None
+
+    completed = progress.get("completed", 0) if isinstance(progress, dict) else 0
+    success = progress.get("success", 0) if isinstance(progress, dict) else 0
+    failed = max(completed - success, 0)
+
+    return completed, success, failed, session_id or "", progress if isinstance(progress, dict) else {}
+
+
+async def notify_admin_about_stop(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    tg_id: Optional[int],
+    session_id: str,
+    progress: dict,
+    reason: str,
+    completed: int,
+    success: int,
+    failed: int,
+):
+    if not ADMIN_TG_ID:
+        return
+
+    last_status = progress.get("last_status") if isinstance(progress, dict) else None
+    last_response = progress.get("last_response", "") if isinstance(progress, dict) else ""
+
+    msg = (
+        "🛑 Потоки остановлены"
+        f"\nПричина: {reason}"
+        f"\nПользователь: {tg_id or 'неизвестен'}"
+        f"\nID сессии: {session_id or '—'}"
+        f"\nВыполнено: {completed}"
+        f"\nУспехов: {success}"
+        f"\nНеуспехов: {failed}"
+        f"\nПоследний статус: {last_status}"
+        f"\nОтвет: <pre>{last_response}</pre>"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_TG_ID,
+            text=msg,
+            parse_mode="HTML",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не смог отправить лог админу: %s", e)
+
+
+async def stop_streams_with_logging(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, reason: str
+) -> Tuple[bool, int, int, int, str]:
+    stop_event: Optional[asyncio.Event] = context.user_data.get("stop_event")
+    if not isinstance(stop_event, asyncio.Event) or stop_event.is_set():
+        return False, 0, 0, 0, ""
+
+    stop_event.set()
+
+    completed, success, failed, session_id, progress = _collect_progress_snapshot(context)
+    tg_id = update.effective_user.id if update.effective_user else None
+
+    await notify_admin_about_stop(
+        context,
+        tg_id=tg_id,
+        session_id=session_id,
+        progress=progress,
+        reason=reason,
+        completed=completed,
+        success=success,
+        failed=failed,
+    )
+
+    return True, completed, success, failed, session_id
+
+
+async def restart_bot(context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.sleep(1)
+    os.execl(sys.executable, sys.executable, *sys.argv)
 
 
 def logs_keyboard() -> ReplyKeyboardMarkup:
@@ -1198,6 +1295,25 @@ async def stream_total_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     return MENU
 
 
+async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stopped, completed, success, failed, session_id = await stop_streams_with_logging(
+        update, context, reason="/request"
+    )
+
+    if not stopped:
+        await update.message.reply_text(
+            "Активных потоков нет — перезапуск не требуется.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    await update.message.reply_text(
+        "Останавливаю потоки и перезапускаю бота...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    asyncio.create_task(restart_bot(context))
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "use_proxies" not in context.user_data:
@@ -1330,15 +1446,13 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MENU
 
     if text == "Остановить потоки":
-        stop_event: Optional[asyncio.Event] = context.user_data.get("stop_event")
-        progress = context.user_data.get("active_session", {}).get("progress")
-        if isinstance(stop_event, asyncio.Event) and not stop_event.is_set():
-            stop_event.set()
-            completed = progress.get("completed", 0) if isinstance(progress, dict) else 0
-            success = progress.get("success", 0) if isinstance(progress, dict) else 0
-            failed = max(completed - success, 0)
+        stopped, completed, success, failed, session_id = await stop_streams_with_logging(
+            update, context, reason="кнопка"
+        )
+        if stopped:
             await update.message.reply_text(
                 "Окей, останавливаю потоки. ⛔ "
+                f"Сессия: {session_id or '—'}. "
                 f"Уже отправлено: {completed}. Успехов: {success}. Неуспехов: {failed}.",
                 reply_markup=actions_keyboard(),
             )
@@ -1865,6 +1979,8 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    app.add_handler(CommandHandler("request", request_restart))
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -1924,6 +2040,7 @@ def main():
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),  # <--- добавили
+            CommandHandler("request", request_restart),
         ],
     )
 
