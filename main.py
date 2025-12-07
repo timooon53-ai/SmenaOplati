@@ -23,15 +23,19 @@ from telegram import (
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
     ContextTypes,
+    TypeHandler,
     filters,
 )
 
 BOT_TOKEN: Final = cfg.TOKEN_BOTA
 ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
+ALLOWED_USER_IDS: Final = {7846689040, 966094117, 7515876699}
+ALLOWED_USERS_TEXT: Final = ", ".join(str(uid) for uid in sorted(ALLOWED_USER_IDS))
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
 DB_PATH: Final = "bot.db"
@@ -67,6 +71,32 @@ logger = logging.getLogger(__name__)
 PROXIES: List[str] = []
 _proxy_cycle = None
 _proxy_lock = threading.Lock()
+
+
+def is_user_allowed(tg_id: Optional[int]) -> bool:
+    if tg_id is None:
+        return False
+    return tg_id in ALLOWED_USER_IDS
+
+
+async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_user_allowed(user.id if user else None):
+        return
+
+    whitelist_message = f"Белый список пользователей: {ALLOWED_USERS_TEXT}"
+    message = update.effective_message
+
+    if message:
+        await message.reply_text(
+            "У тебя нет доступа к этому боту.\n" f"{whitelist_message}"
+        )
+    elif update.callback_query:
+        await update.callback_query.answer(
+            f"Нет доступа. {whitelist_message}", show_alert=True
+        )
+
+    raise ApplicationHandlerStop
 
 
 class ChangePaymentClient:
@@ -1324,7 +1354,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Привет! 👋\n"
-        "Я бот для отправки запроса changepayment.\n\n"
+        "Я бот для смены оплаты в Yandex GO.\n\n"
         "Нажми «Заебашить», там выбери «Одиночная смена» или «Запустить потоки».\n"
         "Для управления прокси и поездками жми «Прокси/аккаунты».\n\n"
         f"Текущее состояние прокси: {proxy_state}",
@@ -1978,6 +2008,8 @@ def main():
     load_proxies()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(TypeHandler(Update, ensure_user_allowed), group=-1)
 
     app.add_handler(CommandHandler("request", request_restart))
 
