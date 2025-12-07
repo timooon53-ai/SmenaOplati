@@ -23,19 +23,15 @@ from telegram import (
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    ApplicationHandlerStop,
     CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
     ContextTypes,
-    TypeHandler,
     filters,
 )
 
 BOT_TOKEN: Final = cfg.TOKEN_BOTA
 ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
-ALLOWED_USER_IDS: Final = {7846689040, 966094117, 7515876699}
-ALLOWED_USERS_TEXT: Final = ", ".join(str(uid) for uid in sorted(ALLOWED_USER_IDS))
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
 DB_PATH: Final = "bot.db"
@@ -73,38 +69,11 @@ _proxy_cycle = None
 _proxy_lock = threading.Lock()
 
 
-def is_user_allowed(tg_id: Optional[int]) -> bool:
-    if tg_id is None:
-        return False
-    return tg_id in ALLOWED_USER_IDS
-
-
-async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if is_user_allowed(user.id if user else None):
-        return
-
-    whitelist_message = f"Белый список пользователей: {ALLOWED_USERS_TEXT}"
-    message = update.effective_message
-
-    if message:
-        await message.reply_text(
-            "У тебя нет доступа к этому боту.\n" f"{whitelist_message}"
-        )
-    elif update.callback_query:
-        await update.callback_query.answer(
-            f"Нет доступа. {whitelist_message}", show_alert=True
-        )
-
-    raise ApplicationHandlerStop
-
-
 class ChangePaymentClient:
     def __init__(self, base_url: str):
         self.base_url = base_url
         self.proxy_pool: List[str] = []
         self._session: Optional[aiohttp.ClientSession] = None
-        self._proxy_index = 0
 
     async def start(self):
         if self._session is None:
@@ -116,15 +85,13 @@ class ChangePaymentClient:
             self._session = None
 
     def update_proxies(self, proxies: List[str]):
-        self.proxy_pool = proxies
-        self._proxy_index = 0
+        self.proxy_pool = list(proxies)
+        random.shuffle(self.proxy_pool)
 
     def _next_proxy(self) -> Optional[str]:
         if not self.proxy_pool:
             return None
-        proxy = self.proxy_pool[self._proxy_index]
-        self._proxy_index = (self._proxy_index + 1) % len(self.proxy_pool)
-        return proxy
+        return random.choice(self.proxy_pool)
 
     async def send_change_payment(
         self,
@@ -310,6 +277,16 @@ def get_next_proxy() -> Optional[str]:
             return None
 
 
+def proxies_enabled() -> bool:
+    return bool(PROXIES)
+
+
+def proxy_state_text() -> str:
+    if PROXIES:
+        return f"ВКЛ ({len(PROXIES)} шт.)"
+    return "нет доступных прокси"
+
+
 
 def get_conn():
     return sqlite3.connect(DB_PATH)
@@ -339,16 +316,6 @@ def init_db():
         cur.execute("ALTER TABLE requests ADD COLUMN session_id TEXT;")
     except sqlite3.OperationalError:
         pass  # уже есть
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS rec_card (
-            tg_id INTEGER PRIMARY KEY,
-            card TEXT NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-    )
 
     cur.execute(
         """
@@ -409,34 +376,6 @@ def get_request_count_for_user(tg_id: int) -> int:
     (count,) = cur.fetchone()
     conn.close()
     return count or 0
-
-
-def save_card_for_user(tg_id: int, card: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO rec_card (tg_id, card)
-        VALUES (?, ?)
-        ON CONFLICT(tg_id) DO UPDATE SET
-            card = excluded.card,
-            updated_at = CURRENT_TIMESTAMP;
-        """,
-        (tg_id, card),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_saved_card_for_user(tg_id: int) -> Optional[str]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT card FROM rec_card WHERE tg_id = ?;", (tg_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return row[0]
-    return None
 
 
 def create_trip_template(tg_id: int) -> int:
@@ -616,9 +555,8 @@ async def do_single_request_and_log(
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["Заебашить", "Профиль"],
-            ["Изменить поездки"],
-            ["Прокси/аккаунты", "Логи"],
+            ["💳 Поменять оплату", "👤 Профиль"],
+            ["🚂 Загрузить поездки", "📜 Логи"],
         ],
         resize_keyboard=True,
     )
@@ -627,10 +565,10 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 def actions_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["Одиночная смена"],
-            ["Запустить потоки"],
-            ["Остановить потоки"],
-            ["Назад"],
+            ["🎯 Одиночная смена"],
+            ["🚀 Запустить потоки"],
+            ["🛑 Остановить потоки"],
+            ["🔙 Назад"],
         ],
         resize_keyboard=True,
     )
@@ -721,21 +659,9 @@ async def restart_bot(context: ContextTypes.DEFAULT_TYPE):
 def logs_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["Посмотреть логи"],
-            ["Логи последней сессии"],
-            ["Назад"],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def proxy_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["Перезагрузить прокси"],
-            ["Прокси вкл/выкл"],
-            ["Загрузить поездки"],
-            ["Назад"],
+            ["📖 Посмотреть логи"],
+            ["🕒 Логи последней сессии"],
+            ["🔙 Назад"],
         ],
         resize_keyboard=True,
     )
@@ -769,6 +695,18 @@ def set_trip_form_mode(context: ContextTypes.DEFAULT_TYPE, trip_id: int, mode: s
 def get_trip_form_mode(context: ContextTypes.DEFAULT_TYPE, trip_id: int) -> str:
     modes = context.user_data.get("trip_form_mode", {})
     return modes.get(trip_id, "create")
+
+
+def set_trip_return_target(
+    context: ContextTypes.DEFAULT_TYPE, trip_id: int, target: str
+):
+    mapping = context.user_data.setdefault("trip_return_to_list", {})
+    mapping[trip_id] = target
+
+
+def pop_trip_return_target(context: ContextTypes.DEFAULT_TYPE, trip_id: int) -> Optional[str]:
+    mapping = context.user_data.get("trip_return_to_list") or {}
+    return mapping.pop(trip_id, None)
 
 
 def _trip_has_values(record: dict) -> bool:
@@ -811,10 +749,10 @@ def trip_form_markup(record: dict, *, mode: str = "create") -> InlineKeyboardMar
     ]
 
     if _trip_has_values(record):
-        save_caption = "Сохранить параметры" if mode == "edit" else "Сохранить"
+        save_caption = "💾 Сохранить параметры" if mode == "edit" else "💾 Сохранить"
         control_row = [InlineKeyboardButton(save_caption, callback_data=f"tripsave:{trip_id}")]
         if mode == "create":
-            control_row.append(InlineKeyboardButton("Очистить", callback_data=f"tripclear:{trip_id}"))
+            control_row.append(InlineKeyboardButton("🧹 Очистить", callback_data=f"tripclear:{trip_id}"))
         buttons.append(control_row)
 
     return InlineKeyboardMarkup(buttons)
@@ -830,16 +768,7 @@ async def show_trip_loader(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MENU
 
-    record = ensure_active_trip_record(tg_id, context)
-    text = (
-        "Загрузи поездку. Нажми на нужный параметр, введи данные, и они сразу"
-        " запишутся в БД. После заполнения любого поля появятся кнопки"
-        " «Сохранить» и «Очистить»."
-    )
-    await update.message.reply_text(
-        text,
-        reply_markup=trip_form_markup(record, mode=get_trip_form_mode(context, record.get("id", 0))),
-    )
+    await send_trip_manager_list(update.message, tg_id, context)
     return MENU
 
 
@@ -880,7 +809,7 @@ async def trip_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if tg_id is None or not isinstance(pending, dict):
         await update.message.reply_text(
-            "Не нашёл активный слот для сохранения. Нажми «Загрузить поездки» снова.",
+            "Не нашёл активный слот для сохранения. Нажми «🚂 Загрузить поездки» снова.",
             reply_markup=main_keyboard(),
         )
         return MENU
@@ -914,13 +843,6 @@ async def send_trip_templates_list(
     chat, tg_id: int, context: ContextTypes.DEFAULT_TYPE
 ):
     templates = list_trip_templates(tg_id)
-    if not templates:
-        await chat.reply_text(
-            "Нет сохранённых поездок. Сначала нажми «Загрузить поездки» и заполни поля.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
     keyboard = [
         [
             InlineKeyboardButton(
@@ -931,10 +853,16 @@ async def send_trip_templates_list(
         for t in templates
     ]
 
-    await chat.reply_text(
-        "Выбери одну из сохранённых поездок:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    keyboard.append(
+        [InlineKeyboardButton("➕ Добавить поездку", callback_data="tripnew:list")]
     )
+
+    if templates:
+        text = "Выбери одну из сохранённых поездок или создай новую:"
+    else:
+        text = "Пока нет сохранённых поездок. Нажми «➕ Добавить поездку», чтобы создать первую."
+
+    await chat.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def show_trip_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -953,27 +881,58 @@ async def show_trip_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_trip_manager_list(chat, tg_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     templates = list_trip_templates(tg_id)
-    if not templates:
-        await chat.reply_text(
-            "Пока нет сохранённых поездок. Сперва нажми «Загрузить поездки».",
-            reply_markup=main_keyboard(),
-        )
-        return False
-
     keyboard = [
         [
             InlineKeyboardButton(
-                f"#{t['id']} | {t.get('orderid') or 'orderid не задан'}",
+                f"🧳 #{t['id']} | {t.get('orderid') or 'orderid не задан'}",
                 callback_data=f"tripmanage:{t['id']}",
             )
         ]
         for t in templates
     ]
+    keyboard.append(
+        [InlineKeyboardButton("➕ Добавить поездку", callback_data="tripnew:manage")]
+    )
+
+    if templates:
+        text = "🚂 Выбери поездку для редактирования или удаления, либо добавь новую ⤵️:"
+    else:
+        text = "🚧 Пока нет сохранённых поездок. Нажми «➕ Добавить поездку», чтобы начать."
+
     await chat.reply_text(
-        "Выбери поездку для редактирования или удаления:",
+        text,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    return True
+    return bool(templates)
+
+
+async def trip_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":", 1)
+    origin = parts[1] if len(parts) > 1 else "list"
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.message.reply_text(
+            "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    trip_id = create_trip_template(tg_id)
+    context.user_data["active_trip_id"] = trip_id
+    set_trip_form_mode(context, trip_id, "create")
+    set_trip_return_target(context, trip_id, origin)
+
+    record = get_trip_template(trip_id, tg_id) or {}
+
+    await query.message.reply_text(
+        "🆕 Создал новую поездку. Заполни поля, нажми «💾 Сохранить» — вернусь к списку.",
+        reply_markup=trip_form_markup(record, mode="create"),
+    )
+    return MENU
 
 
 async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1024,24 +983,29 @@ async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return MENU
 
     text_lines = [
-        f"ID записи: {record['id']}",
-        f"token2: {record.get('token2') or '—'}",
-        f"ID: {record.get('trip_id') or '—'}",
-        f"card-x: {record.get('card') or '—'}",
-        f"orderid: {record.get('orderid') or '—'}",
-        f"Ссылка: {record.get('trip_link') or '—'}",
+        f"🆔 ID записи: {record['id']}",
+        f"🔑 token2: {record.get('token2') or '—'}",
+        f"🪪 ID: {record.get('trip_id') or '—'}",
+        f"💳 card-x: {record.get('card') or '—'}",
+        f"📄 orderid: {record.get('orderid') or '—'}",
+        f"🔗 Ссылка: {record.get('trip_link') or '—'}",
     ]
 
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "Использовать в смене", callback_data=f"tripuse:{record['id']}"
+                    "🚀 Использовать в смене", callback_data=f"tripuse:{record['id']}"
                 ),
                 InlineKeyboardButton(
-                    "Удалить из БД", callback_data=f"tripdelete:{record['id']}"
+                    "🗑️ Удалить из БД", callback_data=f"tripdelete:{record['id']}"
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Редактировать", callback_data=f"tripedit:{record['id']}"
+                )
+            ],
         ]
     )
 
@@ -1084,19 +1048,19 @@ async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     set_trip_form_mode(context, trip_id, "edit")
 
     text_lines = [
-        f"ID записи: {record['id']}",
-        f"token2: {record.get('token2') or '—'}",
-        f"ID: {record.get('trip_id') or '—'}",
-        f"card-x: {record.get('card') or '—'}",
-        f"orderid: {record.get('orderid') or '—'}",
-        f"Ссылка: {record.get('trip_link') or '—'}",
+        f"🆔 ID записи: {record['id']}",
+        f"🔑 token2: {record.get('token2') or '—'}",
+        f"🪪 ID: {record.get('trip_id') or '—'}",
+        f"💳 card-x: {record.get('card') or '—'}",
+        f"📄 orderid: {record.get('orderid') or '—'}",
+        f"🔗 Ссылка: {record.get('trip_link') or '—'}",
     ]
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Редактировать", callback_data=f"tripedit:{record['id']}")],
-            [InlineKeyboardButton("Удалить из БД", callback_data=f"tripdelete:{record['id']}")],
-            [InlineKeyboardButton("Назад к списку", callback_data="tripmanage:back")],
+            [InlineKeyboardButton("✏️ Редактировать", callback_data=f"tripedit:{record['id']}")],
+            [InlineKeyboardButton("🗑️ Удалить из БД", callback_data=f"tripdelete:{record['id']}")],
+            [InlineKeyboardButton("↩️ Назад к списку", callback_data="tripmanage:back")],
         ]
     )
 
@@ -1126,8 +1090,8 @@ async def trip_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["active_trip_id"] = trip_id
 
     await query.message.reply_text(
-        "Редактируем поездку. Нажми на параметр, укажи новое значение и затем"
-        " нажми «Сохранить параметры».",
+        "✏️ Редактируем поездку. Нажми на параметр, укажи новое значение и затем"
+        " нажми «💾 Сохранить параметры».",
         reply_markup=trip_form_markup(record, mode="edit"),
     )
     return MENU
@@ -1155,6 +1119,13 @@ async def trip_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Параметры сохранены в БД.",
         reply_markup=trip_form_markup(record, mode=get_trip_form_mode(context, trip_id)),
     )
+
+    return_target = pop_trip_return_target(context, trip_id)
+    if return_target == "list":
+        await send_trip_templates_list(query.message, tg_id, context)
+    elif return_target == "manage":
+        await send_trip_manager_list(query.message, tg_id, context)
+
     return MENU
 
 
@@ -1310,7 +1281,7 @@ async def stream_total_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     required = [config.get("token"), config.get("orderid"), config.get("card"), config.get("id")]
     if not all(required):
         await update.message.reply_text(
-            "Не все данные заданы. Попробуй снова через «Запустить потоки».",
+            "Не все данные заданы. Попробуй снова через «🚀 Запустить потоки».",
             reply_markup=main_keyboard(),
         )
         return MENU
@@ -1346,18 +1317,12 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "use_proxies" not in context.user_data:
-        context.user_data["use_proxies"] = True
-
-    use_proxies = context.user_data["use_proxies"]
-    proxy_state = "ВКЛ" if use_proxies and PROXIES else "ВЫКЛ (или список пуст)"
-
     await update.message.reply_text(
         "Привет! 👋\n"
-        "Я бот для смены оплаты в Yandex GO.\n\n"
-        "Нажми «Заебашить», там выбери «Одиночная смена» или «Запустить потоки».\n"
-        "Для управления прокси и поездками жми «Прокси/аккаунты».\n\n"
-        f"Текущее состояние прокси: {proxy_state}",
+        "Я бот для отправки запроса changepayment.\n\n"
+        "Нажми «💳 Поменять оплату», там выбери «🎯 Одиночная смена» или «🚀 Запустить потоки».\n"
+        "Кнопка «🚂 Загрузить поездки» — чтобы добавить или обновить поездки.\n\n"
+        f"Прокси: {proxy_state_text()}",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -1378,8 +1343,8 @@ async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if choice == "bulk":
         await query.message.reply_text(
-            "Выбрал массовый запуск. Сначала введи параметры через «Заебашить»,"
-            " а потом нажми «Запустить потоки».",
+            "Выбрал массовый запуск. Сначала введи параметры через «💳 Поменять оплату»,"
+            " а потом нажми «🚀 Запустить потоки».",
             reply_markup=main_keyboard(),
         )
         return MENU
@@ -1402,24 +1367,10 @@ async def ask_orderid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orderid = update.message.text.strip()
     context.user_data["orderid"] = orderid
 
-    user = update.effective_user
-    tg_id = user.id if user else None
-
-    saved_card = get_saved_card_for_user(tg_id) if tg_id is not None else None
-
-    if saved_card:
-        context.user_data["card"] = saved_card
-        await update.message.reply_text(
-            f"Использую запомненную карту: {saved_card}\n"
-            f"Если хочешь её изменить — просто отправь новую карту в ответ на этот запрос.\n\n"
-            f"Теперь отправь, пожалуйста, <id>:"
-        )
-        return ASK_ID
-    else:
-        await update.message.reply_text(
-            "Принято. Теперь отправь, пожалуйста, <card> (payment_method_id):"
-        )
-        return ASK_CARD
+    await update.message.reply_text(
+        "Принято. Теперь отправь, пожалуйста, <card> (payment_method_id):"
+    )
+    return ASK_CARD
 
 
 async def ask_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1439,11 +1390,11 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Все параметры сохранены ✅\n\n"
         "Теперь ты можешь:\n"
-        "• Через «Заебашить» → «Одиночная смена» — один POST-запрос.\n"
-        "• Через «Заебашить» → «Запустить потоки» — массовая отправка.\n"
-        "• «Профиль» — статистика.\n"
-        "• «Логи» — меню для выгрузки логов.\n"
-        "• «Прокси/аккаунты» — работа с прокси и поездками.",
+        "• Через «💳 Поменять оплату» → «🎯 Одиночная смена» — один POST-запрос.\n"
+        "• Через «💳 Поменять оплату» → «🚀 Запустить потоки» — массовая отправка.\n"
+        "• «👤 Профиль» — статистика.\n"
+        "• «📜 Логи» — меню для выгрузки логов.\n"
+        "• «🚂 Загрузить поездки» — добавление и редактирование поездок.",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -1452,15 +1403,14 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    if text == "Заебашить":
+    if text == "💳 Поменять оплату":
         await update.message.reply_text(
-            "Выбери действие:", reply_markup=actions_keyboard()
+            "Выбери действие ⤵️:", reply_markup=actions_keyboard()
         )
         return MENU
 
-    if text == "Одиночная смена":
-        use_proxies = context.user_data.get("use_proxies", True)
-        proxy_state = "ВКЛ" if use_proxies and PROXIES else "ВЫКЛ (или список пуст)"
+    if text == "🎯 Одиночная смена":
+        proxy_state = proxy_state_text()
         await update.message.reply_text(
             "Окей, погнали. 🚀\n"
             f"Сейчас прокси: {proxy_state}\n\n"
@@ -1469,13 +1419,13 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_TOKEN
 
-    if text == "Запустить потоки":
+    if text == "🚀 Запустить потоки":
         await update.message.reply_text(
-            "Выбери, как запускать потоки:", reply_markup=stream_start_markup()
+            "Выбери, как запускать потоки ⚙️:", reply_markup=stream_start_markup()
         )
         return MENU
 
-    if text == "Остановить потоки":
+    if text == "🛑 Остановить потоки":
         stopped, completed, success, failed, session_id = await stop_streams_with_logging(
             update, context, reason="кнопка"
         )
@@ -1493,59 +1443,29 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return MENU
 
-    if text == "Назад":
-        await update.message.reply_text("Возвращаюсь в меню.", reply_markup=main_keyboard())
+    if text == "🔙 Назад":
+        await update.message.reply_text("Возвращаюсь в меню ↩️.", reply_markup=main_keyboard())
         return MENU
 
-    if text == "Профиль":
+    if text == "👤 Профиль":
         return await show_profile(update, context)
 
-    if text == "Логи":
-        await update.message.reply_text("Что показать?", reply_markup=logs_keyboard())
+    if text == "📜 Логи":
+        await update.message.reply_text("Что показать? 📂", reply_markup=logs_keyboard())
         return MENU
 
-    if text == "Посмотреть логи":
+    if text == "📖 Посмотреть логи":
         await update.message.reply_text(
             "Введи ID сессии (5–7 цифр), лог которой хочешь получить:",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ASK_LOG_SESSION_ID
 
-    if text == "Логи последней сессии":
+    if text == "🕒 Логи последней сессии":
         return await last_session_logs(update, context)
 
-    if text == "Прокси/аккаунты":
-        await update.message.reply_text(
-            "Управляем прокси и поездками.", reply_markup=proxy_keyboard()
-        )
-        return MENU
-
-    if text == "Прокси вкл/выкл":
-        current = context.user_data.get("use_proxies", True)
-        new_value = not current
-        context.user_data["use_proxies"] = new_value
-        state = "ВКЛ" if new_value and PROXIES else "ВЫКЛ (или список пуст)"
-        await update.message.reply_text(
-            f"Прокси теперь: {state}",
-            reply_markup=proxy_keyboard(),
-        )
-        return MENU
-
-    if text == "Перезагрузить прокси":
-        load_proxies()
-        use_proxies = context.user_data.get("use_proxies", True)
-        state = "ВКЛ" if use_proxies and PROXIES else "ВЫКЛ (или список пуст)"
-        await update.message.reply_text(
-            f"Прокси перечитаны. Текущее состояние: {state}",
-            reply_markup=proxy_keyboard(),
-        )
-        return MENU
-
-    if text == "Загрузить поездки":
+    if text == "🚂 Загрузить поездки":
         return await show_trip_loader(update, context)
-
-    if text == "Изменить поездки":
-        return await show_trip_manager(update, context)
 
     await update.message.reply_text(
         "Не понял команду. Используй кнопки на клавиатуре.",
@@ -1566,27 +1486,15 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MENU
 
     total_requests = get_request_count_for_user(tg_id)
-    saved_card = get_saved_card_for_user(tg_id)
     last_session_id = context.user_data.get("last_session_id")
-    use_proxies = context.user_data.get("use_proxies", True)
-    proxy_state = "ВКЛ" if use_proxies and PROXIES else "ВЫКЛ (или список пуст)"
+    proxy_state = proxy_state_text()
 
-    if saved_card:
-        msg = (
-            f"👤 Профиль\n\n"
-            f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
-            f"Всего отправлено запросов: <b>{total_requests}</b>\n"
-            f"Запомненная карта: <code>{html.escape(saved_card)}</code>\n"
-        )
-    else:
-        msg = (
-            f"👤 Профиль\n\n"
-            f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
-            f"Всего отправлено запросов: <b>{total_requests}</b>\n"
-            f"Запомненная карта: не сохранена\n"
-        )
-
-    msg += f"\nПрокси: {proxy_state}\n"
+    msg = (
+        f"👤 Профиль\n\n"
+        f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
+        f"Всего отправлено запросов: <b>{total_requests}</b>\n"
+        f"Прокси: {proxy_state}\n"
+    )
 
     if last_session_id:
         msg += f"\nПоследний ID сессии: <code>{html.escape(str(last_session_id))}</code>\n"
@@ -1595,31 +1503,6 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         msg,
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
-    return MENU
-
-
-async def remember_card_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    tg_id = user.id if user else None
-
-    if tg_id is None:
-        await update.message.reply_text(
-            "Не смог получить твой TG ID 🤔 Попробуй ещё раз.",
-            reply_markup=main_keyboard(),
-        )
-        return MENU
-
-    card = update.message.text.strip()
-    save_card_for_user(tg_id, card)
-    context.user_data["card"] = card
-
-    await update.message.reply_text(
-        f"Карта <code>{html.escape(card)}</code> сохранена ✅\n"
-        f"Теперь она будет автоматически подставляться в запросы.\n"
-        f"Если захочешь её поменять — отправь другую карту, и я её обновлю.",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -1773,29 +1656,22 @@ async def change_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_token = context.user_data.get("token")
     orderid = context.user_data.get("orderid")
-
-    saved_card = get_saved_card_for_user(tg_id)
-    if saved_card:
-        card = saved_card
-        context.user_data["card"] = card
-    else:
-        card = context.user_data.get("card")
+    card = context.user_data.get("card")
 
     _id = context.user_data.get("id")
 
     if not all([user_token, orderid, card, _id]):
         await update.message.reply_text(
-            "Похоже, какие-то параметры не заданы. Нажми «Заебашить» и введи данные заново.",
+            "Похоже, какие-то параметры не заданы. Нажми «💳 Поменять оплату» и введи данные заново.",
             reply_markup=main_keyboard(),
         )
         return MENU
 
-    use_proxies = context.user_data.get("use_proxies", True)
-
     session_id = generate_session_id()
     context.user_data["last_session_id"] = session_id
 
-    proxy_state = "ВКЛ" if use_proxies and PROXIES else "ВЫКЛ (или список пуст)"
+    use_proxies = proxies_enabled()
+    proxy_state = proxy_state_text()
 
     await update.message.reply_text(
         f"Отправляю запрос... ⏳\n"
@@ -1870,25 +1746,19 @@ async def bulk_change_payment(
 
     user_token = context.user_data.get("token")
     orderid = context.user_data.get("orderid")
-
-    saved_card = get_saved_card_for_user(tg_id)
-    if saved_card:
-        card = saved_card
-        context.user_data["card"] = card
-    else:
-        card = context.user_data.get("card")
+    card = context.user_data.get("card")
 
     _id = context.user_data.get("id")
 
     if not all([user_token, orderid, card, _id]):
         await update.message.reply_text(
-            "Параметры не заданы полностью. Нажми «Заебашить» и введи данные.",
+            "Параметры не заданы полностью. Нажми «💳 Поменять оплату» и введи данные.",
             reply_markup=main_keyboard(),
         )
         return
 
-    use_proxies = context.user_data.get("use_proxies", True)
-    proxy_state = "ВКЛ" if use_proxies and PROXIES else "ВЫКЛ (или список пуст)"
+    use_proxies = proxies_enabled()
+    proxy_state = proxy_state_text()
 
     headers = build_headers(user_token)
     payload = build_payload(orderid, card, _id)
@@ -2009,8 +1879,6 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(TypeHandler(Update, ensure_user_allowed), group=-1)
-
     app.add_handler(CommandHandler("request", request_restart))
 
     conv = ConversationHandler(
@@ -2027,14 +1895,12 @@ def main():
                 CallbackQueryHandler(streams_option_callback, pattern="^streams:"),
                 CallbackQueryHandler(trip_select_callback, pattern="^tripselect:"),
                 CallbackQueryHandler(trip_manage_callback, pattern="^tripmanage:"),
+                CallbackQueryHandler(trip_new_callback, pattern="^tripnew:"),
                 CallbackQueryHandler(trip_edit_callback, pattern="^tripedit:"),
                 CallbackQueryHandler(trip_delete_callback, pattern="^tripdelete:"),
                 CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
                 CallbackQueryHandler(start_choice_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
-            ],
-            REMEMBER_CARD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, remember_card_handler)
             ],
             ASK_THREADS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_threads_handler)
