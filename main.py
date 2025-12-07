@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import html
+from functools import wraps
 from typing import Final, Optional, Tuple, List, Callable, Awaitable
 
 import aiohttp
@@ -32,6 +33,7 @@ from telegram.ext import (
 
 BOT_TOKEN: Final = cfg.TOKEN_BOTA
 ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
+ALLOWED_USER_IDS: Final = {7515876699, 966094117, 7846689040, 8143695937}
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
 DB_PATH: Final = "bot.db"
@@ -54,7 +56,8 @@ PROXY_FILE: Final = "proxy.txt"
     ASK_STREAM_ID,
     ASK_STREAM_THREADS,
     ASK_STREAM_TOTAL,
-) = range(16)
+    ASK_TRIP_TEXT,
+) = range(17)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -67,6 +70,33 @@ logger = logging.getLogger(__name__)
 PROXIES: List[str] = []
 _proxy_cycle = None
 _proxy_lock = threading.Lock()
+
+
+def is_user_allowed(user) -> bool:
+    return user is not None and user.id in ALLOWED_USER_IDS
+
+
+async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if is_user_allowed(update.effective_user):
+        return True
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Доступ запрещён. Обратись к администратору.",
+        )
+    return False
+
+
+def require_access(handler):
+    @wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not await ensure_user_allowed(update, context):
+            return ConversationHandler.END
+        return await handler(update, context, *args, **kwargs)
+
+    return wrapper
 
 
 class ChangePaymentClient:
@@ -758,7 +788,55 @@ def trip_form_markup(record: dict, *, mode: str = "create") -> InlineKeyboardMar
     return InlineKeyboardMarkup(buttons)
 
 
+@require_access
 async def show_trip_loader(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📄 Текстом", callback_data="tripload:text")],
+            [InlineKeyboardButton("📝 Заполняя поля", callback_data="tripload:form")],
+        ]
+    )
+
+    await update.message.reply_text(
+        "Как загрузить поездку? Выбери способ ниже ⤵️:",
+        reply_markup=keyboard,
+    )
+    return MENU
+
+
+@require_access
+async def trip_load_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":", 1)
+    choice = parts[1] if len(parts) > 1 else ""
+
+    if choice == "form":
+        user = update.effective_user
+        tg_id = user.id if user else None
+        if tg_id is None:
+            await query.message.reply_text(
+                "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+            )
+            return MENU
+
+        await send_trip_manager_list(query.message, tg_id, context)
+        return MENU
+
+    if choice == "text":
+        await query.message.reply_text(
+            "Пришли данные в формате: ID/ORDERID/CARD-X/TOKEN2.\n"
+            "Недостающие поля можно опустить — оставлю их пустыми.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_TRIP_TEXT
+
+    await query.message.reply_text("Не понял выбор.", reply_markup=main_keyboard())
+    return MENU
+
+
+@require_access
+async def trip_text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tg_id = user.id if user else None
 
@@ -768,10 +846,33 @@ async def show_trip_loader(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MENU
 
-    await send_trip_manager_list(update.message, tg_id, context)
+    raw_text = update.message.text.strip()
+    parts = [part.strip() for part in raw_text.split("/")]
+    values = {
+        "trip_id": parts[0] if len(parts) > 0 else "",
+        "orderid": parts[1] if len(parts) > 1 else "",
+        "card": parts[2] if len(parts) > 2 else "",
+        "token2": parts[3] if len(parts) > 3 else "",
+    }
+
+    trip_db_id = create_trip_template(tg_id)
+    context.user_data["active_trip_id"] = trip_db_id
+    set_trip_form_mode(context, trip_db_id, "edit")
+
+    for field in ("trip_id", "orderid", "card", "token2"):
+        if values.get(field):
+            update_trip_template_field(trip_db_id, tg_id, field, values[field])
+
+    record = get_trip_template(trip_db_id, tg_id) or {}
+
+    await update.message.reply_text(
+        "Сохранил данные из текста. Недостающие поля оставил пустыми.",
+        reply_markup=trip_form_markup(record, mode="edit"),
+    )
     return MENU
 
 
+@require_access
 async def tripfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -802,6 +903,7 @@ async def tripfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ASK_TRIP_VALUE
 
 
+@require_access
 async def trip_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tg_id = user.id if user else None
@@ -865,6 +967,7 @@ async def send_trip_templates_list(
     await chat.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+@require_access
 async def show_trip_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tg_id = user.id if user else None
@@ -906,6 +1009,7 @@ async def send_trip_manager_list(chat, tg_id: int, context: ContextTypes.DEFAULT
     return bool(templates)
 
 
+@require_access
 async def trip_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -935,6 +1039,7 @@ async def trip_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+@require_access
 async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -964,6 +1069,7 @@ async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_
     return MENU
 
 
+@require_access
 async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1013,6 +1119,7 @@ async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return MENU
 
 
+@require_access
 async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1068,6 +1175,7 @@ async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return MENU
 
 
+@require_access
 async def trip_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1097,6 +1205,7 @@ async def trip_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return MENU
 
 
+@require_access
 async def trip_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1129,6 +1238,7 @@ async def trip_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return MENU
 
 
+@require_access
 async def trip_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1158,6 +1268,8 @@ async def trip_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     return MENU
 
 
+@require_access
+@require_access
 async def trip_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1180,6 +1292,8 @@ async def trip_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return MENU
 
 
+@require_access
+@require_access
 async def trip_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1210,6 +1324,7 @@ async def trip_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_THREADS
 
 
+@require_access
 async def stream_token_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = update.message.text.strip()
     context.user_data.setdefault("stream_config", {})["token"] = token
@@ -1219,6 +1334,7 @@ async def stream_token_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     return ASK_STREAM_ORDERID
 
 
+@require_access
 async def stream_orderid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orderid = update.message.text.strip()
     context.user_data.setdefault("stream_config", {})["orderid"] = orderid
@@ -1228,6 +1344,7 @@ async def stream_orderid_handler(update: Update, context: ContextTypes.DEFAULT_T
     return ASK_STREAM_CARD
 
 
+@require_access
 async def stream_card_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     card = update.message.text.strip()
     context.user_data.setdefault("stream_config", {})["card"] = card
@@ -1237,6 +1354,7 @@ async def stream_card_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_STREAM_ID
 
 
+@require_access
 async def stream_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
     context.user_data.setdefault("stream_config", {})["id"] = val
@@ -1246,6 +1364,7 @@ async def stream_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_STREAM_THREADS
 
 
+@require_access
 async def stream_threads_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
@@ -1265,6 +1384,7 @@ async def stream_threads_handler(update: Update, context: ContextTypes.DEFAULT_T
     return ASK_STREAM_TOTAL
 
 
+@require_access
 async def stream_total_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
@@ -1296,6 +1416,7 @@ async def stream_total_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     return MENU
 
 
+@require_access
 async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stopped, completed, success, failed, session_id = await stop_streams_with_logging(
         update, context, reason="/request"
@@ -1316,6 +1437,7 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(restart_bot(context))
 
 
+@require_access
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! 👋\n"
@@ -1328,6 +1450,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+@require_access
 async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1353,6 +1476,7 @@ async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
     return MENU
 
 
+@require_access
 async def ask_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = update.message.text.strip()
     context.user_data["token"] = token
@@ -1363,6 +1487,7 @@ async def ask_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_ORDERID
 
 
+@require_access
 async def ask_orderid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orderid = update.message.text.strip()
     context.user_data["orderid"] = orderid
@@ -1373,6 +1498,7 @@ async def ask_orderid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_CARD
 
 
+@require_access
 async def ask_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     card = update.message.text.strip()
     context.user_data["card"] = card
@@ -1383,6 +1509,7 @@ async def ask_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_ID
 
 
+@require_access
 async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _id = update.message.text.strip()
     context.user_data["id"] = _id
@@ -1400,6 +1527,7 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+@require_access
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
@@ -1474,6 +1602,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+@require_access
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tg_id = user.id if user else None
@@ -1509,6 +1638,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+@require_access
 async def ask_threads_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
@@ -1530,6 +1660,7 @@ async def ask_threads_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_TOTAL_REQUESTS
 
 
+@require_access
 async def ask_total_requests_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
@@ -1556,6 +1687,7 @@ async def ask_total_requests_handler(update: Update, context: ContextTypes.DEFAU
     return MENU
 
 
+@require_access
 async def ask_log_session_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tg_id = user.id if user else None
@@ -1602,6 +1734,7 @@ async def ask_log_session_handler(update: Update, context: ContextTypes.DEFAULT_
     return MENU
 
 
+@require_access
 async def last_session_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tg_id = user.id if user else None
@@ -1647,6 +1780,7 @@ async def last_session_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+@require_access
 async def change_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Один запрос (отдельная сессия).
@@ -1892,6 +2026,7 @@ def main():
                 CallbackQueryHandler(tripfield_callback, pattern="^tripfield:"),
                 CallbackQueryHandler(trip_save_callback, pattern="^tripsave:"),
                 CallbackQueryHandler(trip_clear_callback, pattern="^tripclear:"),
+                CallbackQueryHandler(trip_load_choice_callback, pattern="^tripload:"),
                 CallbackQueryHandler(streams_option_callback, pattern="^streams:"),
                 CallbackQueryHandler(trip_select_callback, pattern="^tripselect:"),
                 CallbackQueryHandler(trip_manage_callback, pattern="^tripmanage:"),
@@ -1933,6 +2068,9 @@ def main():
             ],
             ASK_STREAM_TOTAL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, stream_total_handler)
+            ],
+            ASK_TRIP_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, trip_text_input_handler)
             ],
         },
         fallbacks=[
