@@ -357,10 +357,16 @@ def init_db():
             card TEXT,
             orderid TEXT,
             trip_link TEXT,
+            session_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
+
+    try:
+        cur.execute("ALTER TABLE trip_templates ADD COLUMN session_id TEXT;")
+    except sqlite3.OperationalError:
+        pass  # уже есть
 
     conn.commit()
     conn.close()
@@ -428,7 +434,7 @@ def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, token2, trip_id, card, orderid, trip_link
+        SELECT id, token2, trip_id, card, orderid, trip_link, session_id
         FROM trip_templates
         WHERE id = ? AND tg_id = ?
         LIMIT 1;
@@ -438,13 +444,13 @@ def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
     row = cur.fetchone()
     conn.close()
     if row:
-        keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link"]
+        keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link", "session_id"]
         return dict(zip(keys, row))
     return None
 
 
 def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str) -> None:
-    if field not in {"token2", "trip_id", "card", "orderid", "trip_link"}:
+    if field not in {"token2", "trip_id", "card", "orderid", "trip_link", "session_id"}:
         return
     conn = get_conn()
     cur = conn.cursor()
@@ -452,6 +458,18 @@ def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str)
         f"UPDATE trip_templates SET {field} = ? WHERE id = ? AND tg_id = ?;",
         (value, trip_id, tg_id),
     )
+
+    if field == "token2":
+        cur.execute(
+            "UPDATE trip_templates SET session_id = NULL WHERE id = ? AND tg_id = ?;",
+            (trip_id, tg_id),
+        )
+    elif field == "session_id":
+        cur.execute(
+            "UPDATE trip_templates SET token2 = NULL WHERE id = ? AND tg_id = ?;",
+            (trip_id, tg_id),
+        )
+
     conn.commit()
     conn.close()
 
@@ -461,7 +479,7 @@ def list_trip_templates(tg_id: int) -> List[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, token2, trip_id, card, orderid, trip_link, created_at
+        SELECT id, token2, trip_id, card, orderid, trip_link, session_id, created_at
         FROM trip_templates
         WHERE tg_id = ?
         ORDER BY id DESC;
@@ -470,7 +488,7 @@ def list_trip_templates(tg_id: int) -> List[dict]:
     )
     rows = cur.fetchall()
     conn.close()
-    keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link", "created_at"]
+    keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link", "session_id", "created_at"]
     return [dict(zip(keys, row)) for row in rows]
 
 
@@ -492,7 +510,8 @@ def clear_trip_template(trip_id: int, tg_id: int) -> None:
             trip_id = NULL,
             card = NULL,
             orderid = NULL,
-            trip_link = NULL
+            trip_link = NULL,
+            session_id = NULL
         WHERE id = ? AND tg_id = ?;
         """,
         (trip_id, tg_id),
@@ -543,14 +562,20 @@ def export_session_logs_to_file(tg_id: int, session_id: str) -> Optional[str]:
 
 
 
-def build_headers(user_token: str) -> dict:
-    return {
+def build_headers(user_token: Optional[str] = None, session_cookie: Optional[str] = None) -> dict:
+    headers = {
         "Accept-Encoding": "gzip, deflate, br",
         "Accept-Language": "ru",
         "Content-Type": "application/json; charset=utf-8",
         "User-Agent": "ru.yandex.ytaxi/700.100.0.500995 (iPhone; iPhone14,4; iOS 18.3.1; Darwin)",
-        "Authorization": f"Bearer {user_token}",
     }
+
+    if session_cookie:
+        headers["Cookie"] = f"Session_id={session_cookie}"
+    elif user_token:
+        headers["Authorization"] = f"Bearer {user_token}"
+
+    return headers
 
 
 def build_payload(orderid: str, card: str, _id: str) -> dict:
@@ -740,7 +765,10 @@ def pop_trip_return_target(context: ContextTypes.DEFAULT_TYPE, trip_id: int) -> 
 
 
 def _trip_has_values(record: dict) -> bool:
-    return any(record.get(field) for field in ("token2", "trip_id", "card", "orderid", "trip_link"))
+    return any(
+        record.get(field)
+        for field in ("token2", "session_id", "trip_id", "card", "orderid", "trip_link")
+    )
 
 
 def trip_form_markup(record: dict, *, mode: str = "create") -> InlineKeyboardMarkup:
@@ -750,6 +778,12 @@ def trip_form_markup(record: dict, *, mode: str = "create") -> InlineKeyboardMar
             InlineKeyboardButton(
                 f"{_field_icon(record.get('token2'))} token2",
                 callback_data=f"tripfield:{trip_id}:token2",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{_field_icon(record.get('session_id'))} session_id",
+                callback_data=f"tripfield:{trip_id}:session_id",
             )
         ],
         [
@@ -825,8 +859,9 @@ async def trip_load_choice_callback(update: Update, context: ContextTypes.DEFAUL
 
     if choice == "text":
         await query.message.reply_text(
-            "Пришли данные в формате: ID/ORDERID/CARD-X/TOKEN2.\n"
-            "Недостающие поля можно опустить — оставлю их пустыми.",
+            "Пришли данные в формате: ID/ORDERID/CARD-X/TOKEN2[/SESSION_ID].\n"
+            "Недостающие поля можно опустить — оставлю их пустыми."
+            " Если укажешь session_id, token2 очищу автоматически.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ASK_TRIP_TEXT
@@ -853,13 +888,17 @@ async def trip_text_input_handler(update: Update, context: ContextTypes.DEFAULT_
         "orderid": parts[1] if len(parts) > 1 else "",
         "card": parts[2] if len(parts) > 2 else "",
         "token2": parts[3] if len(parts) > 3 else "",
+        "session_id": parts[4] if len(parts) > 4 else "",
     }
+
+    if values.get("session_id"):
+        values["token2"] = ""
 
     trip_db_id = create_trip_template(tg_id)
     context.user_data["active_trip_id"] = trip_db_id
     set_trip_form_mode(context, trip_db_id, "edit")
 
-    for field in ("trip_id", "orderid", "card", "token2"):
+    for field in ("trip_id", "orderid", "card", "token2", "session_id"):
         if values.get(field):
             update_trip_template_field(trip_db_id, tg_id, field, values[field])
 
@@ -891,6 +930,7 @@ async def tripfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     field_names = {
         "token2": "token2",
+        "session_id": "session_id",
         "trip_id": "ID",
         "card": "card-x",
         "orderid": "orderid",
@@ -1091,6 +1131,7 @@ async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     text_lines = [
         f"🆔 ID записи: {record['id']}",
         f"🔑 token2: {record.get('token2') or '—'}",
+        f"🍪 session_id: {record.get('session_id') or '—'}",
         f"🪪 ID: {record.get('trip_id') or '—'}",
         f"💳 card-x: {record.get('card') or '—'}",
         f"📄 orderid: {record.get('orderid') or '—'}",
@@ -1157,6 +1198,7 @@ async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     text_lines = [
         f"🆔 ID записи: {record['id']}",
         f"🔑 token2: {record.get('token2') or '—'}",
+        f"🍪 session_id: {record.get('session_id') or '—'}",
         f"🪪 ID: {record.get('trip_id') or '—'}",
         f"💳 card-x: {record.get('card') or '—'}",
         f"📄 orderid: {record.get('orderid') or '—'}",
@@ -1311,7 +1353,23 @@ async def trip_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Не нашёл запись.")
         return MENU
 
-    context.user_data["token"] = record.get("token2")
+    token = record.get("token2")
+    session_cookie = record.get("session_id")
+
+    if not token and not session_cookie:
+        await query.message.reply_text(
+            "В этой поездке не задан token2 или session_id. Заполни хотя бы одно поле и попробуй снова.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    if session_cookie:
+        context.user_data["session_cookie"] = session_cookie
+        context.user_data.pop("token", None)
+    else:
+        context.user_data["token"] = token
+        context.user_data.pop("session_cookie", None)
+
     context.user_data["orderid"] = record.get("orderid")
     context.user_data["card"] = record.get("card")
     context.user_data["id"] = record.get("trip_id")
@@ -1328,6 +1386,7 @@ async def trip_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stream_token_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = update.message.text.strip()
     context.user_data.setdefault("stream_config", {})["token"] = token
+    context.user_data.setdefault("stream_config", {}).pop("session_cookie", None)
     await update.message.reply_text(
         "Принял token2. Теперь введи orderid:", reply_markup=ReplyKeyboardRemove()
     )
@@ -1480,6 +1539,7 @@ async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def ask_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = update.message.text.strip()
     context.user_data["token"] = token
+    context.user_data.pop("session_cookie", None)
 
     await update.message.reply_text(
         "Ок. Теперь отправь, пожалуйста, <orderid>:"
@@ -1789,12 +1849,13 @@ async def change_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = user.id if user else 0
 
     user_token = context.user_data.get("token")
+    session_cookie = context.user_data.get("session_cookie")
     orderid = context.user_data.get("orderid")
     card = context.user_data.get("card")
 
     _id = context.user_data.get("id")
 
-    if not all([user_token, orderid, card, _id]):
+    if not ((user_token or session_cookie) and orderid and card and _id):
         await update.message.reply_text(
             "Похоже, какие-то параметры не заданы. Нажми «💳 Поменять оплату» и введи данные заново.",
             reply_markup=main_keyboard(),
@@ -1814,7 +1875,7 @@ async def change_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
-    headers = build_headers(user_token)
+    headers = build_headers(user_token, session_cookie)
     payload = build_payload(orderid, card, _id)
 
     ok, status_code, response_text = await do_single_request_and_log(
@@ -1879,12 +1940,13 @@ async def bulk_change_payment(
         return
 
     user_token = context.user_data.get("token")
+    session_cookie = context.user_data.get("session_cookie")
     orderid = context.user_data.get("orderid")
     card = context.user_data.get("card")
 
     _id = context.user_data.get("id")
 
-    if not all([user_token, orderid, card, _id]):
+    if not ((user_token or session_cookie) and orderid and card and _id):
         await update.message.reply_text(
             "Параметры не заданы полностью. Нажми «💳 Поменять оплату» и введи данные.",
             reply_markup=main_keyboard(),
@@ -1894,7 +1956,7 @@ async def bulk_change_payment(
     use_proxies = proxies_enabled()
     proxy_state = proxy_state_text()
 
-    headers = build_headers(user_token)
+    headers = build_headers(user_token, session_cookie)
     payload = build_payload(orderid, card, _id)
 
     session_id = generate_session_id()
