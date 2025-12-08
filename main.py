@@ -573,13 +573,17 @@ async def fetch_session_details(session_id: str) -> dict:
     }
 
     cookies = {"Session_id": session_id}
-    result: dict = {"session_id": session_id}
+    result: dict = {"session_id": session_id, "_debug_responses": []}
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers, cookies=cookies
         ) as resp:
             launch_text = await resp.text()
+
+    result["_debug_responses"].append(
+        {"step": "launch", "response": _pretty_json_or_text(launch_text)}
+    )
 
     user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
     if user_id_match:
@@ -602,13 +606,20 @@ async def fetch_session_details(session_id: str) -> dict:
         ) as resp:
             payment_text = await resp.text()
 
+    result["_debug_responses"].append(
+        {"step": "paymentmethods", "response": _pretty_json_or_text(payment_text)}
+    )
+
     card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
     if card_match:
         result["card"] = card_match.group(1)
 
     token2 = await fetch_token2(session_id)
     if token2:
-        orderid, price = await fetch_order_history_orderid(token2, session_id)
+        orderid, price, history_resp = await fetch_order_history_orderid(token2, session_id)
+        result["_debug_responses"].append(
+            {"step": "order_history", "response": _pretty_json_or_text(history_resp)}
+        )
         if orderid:
             result["orderid"] = orderid
         if price is not None:
@@ -623,6 +634,29 @@ def _generate_random_user_id() -> str:
     mixed = letters + digits
     random.shuffle(mixed)
     return "".join(mixed)
+
+
+def _pretty_json_or_text(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        return raw
+
+
+def _format_debug_responses(responses: Optional[list]) -> str:
+    if not isinstance(responses, list) or not responses:
+        return ""
+
+    chunks = ["Ответы запросов (JSON):"]
+    for entry in responses:
+        if not isinstance(entry, dict):
+            continue
+        step = entry.get("step") or "request"
+        body = entry.get("response") or ""
+        chunks.append(f"{step}:\n```json\n{body}\n```")
+
+    return "\n".join(chunks)
 
 
 async def fetch_token2(session_id: str) -> Optional[str]:
@@ -706,14 +740,14 @@ def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Option
                     item_id = data.get("item_id")
                     if isinstance(item_id, dict):
                         nested = item_id.get("order_id") or item_id.get("orderid")
-                        if isinstance(nested, str) and nested:
-                            orderid = nested
+                        if isinstance(nested, (str, int)) and nested:
+                            orderid = str(nested)
 
                     if orderid is None:
                         for key in ("orderid", "order_id"):
                             val = data.get(key)
-                            if isinstance(val, str) and val:
-                                orderid = val
+                            if isinstance(val, (str, int)) and val:
+                                orderid = str(val)
                                 break
 
                     payment = data.get("payment")
@@ -736,8 +770,8 @@ def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Option
                 if orderid is None:
                     for key in ("orderid", "order_id", "id"):
                         val = item.get(key)
-                        if isinstance(val, str) and val:
-                            orderid = val
+                        if isinstance(val, (str, int)) and val:
+                            orderid = str(val)
                             break
     except Exception:  # noqa: BLE001
         pass
@@ -747,10 +781,17 @@ def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Option
         if match:
             orderid = match.group(1)
 
+    if orderid is None:
+        match = re.search(r"\"order_id\"\s*:\s*\"([^\"]+)\"", resp_text)
+        if match:
+            orderid = match.group(1)
+
     return orderid, price
 
 
-async def fetch_order_history_orderid(token2: str, session_id: str) -> Tuple[Optional[str], Optional[float]]:
+async def fetch_order_history_orderid(
+    token2: str, session_id: str
+) -> Tuple[Optional[str], Optional[float], str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) yandex-taxi/700.116.0.501961",
         "Connection": "keep-alive",
@@ -801,7 +842,8 @@ async def fetch_order_history_orderid(token2: str, session_id: str) -> Tuple[Opt
         ) as resp:
             resp_text = await resp.text()
 
-    return _extract_orderid_from_history(resp_text)
+    orderid, price = _extract_orderid_from_history(resp_text)
+    return orderid, price, resp_text
 
 
 async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) -> str:
@@ -827,6 +869,10 @@ async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) 
 
     if updated_fields:
         notes.append("Автоматически подставил: " + ", ".join(updated_fields))
+
+    debug_block = _format_debug_responses(parsed.get("_debug_responses"))
+    if debug_block:
+        notes.append(debug_block)
 
     if notes:
         return "\n".join(notes)
