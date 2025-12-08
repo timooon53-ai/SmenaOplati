@@ -608,9 +608,11 @@ async def fetch_session_details(session_id: str) -> dict:
 
     token2 = await fetch_token2(session_id)
     if token2:
-        orderid = await fetch_order_history_orderid(token2, session_id)
+        orderid, price = await fetch_order_history_orderid(token2, session_id)
         if orderid:
             result["orderid"] = orderid
+        if price is not None:
+            result["price"] = price
 
     return result
 
@@ -685,7 +687,10 @@ async def fetch_token2(session_id: str) -> Optional[str]:
     return None
 
 
-def _extract_orderid_from_history(resp_text: str) -> Optional[str]:
+def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Optional[float]]:
+    orderid: Optional[str] = None
+    price: Optional[float] = None
+
     try:
         payload = json.loads(resp_text)
         orders = (
@@ -702,27 +707,50 @@ def _extract_orderid_from_history(resp_text: str) -> Optional[str]:
                     if isinstance(item_id, dict):
                         nested = item_id.get("order_id") or item_id.get("orderid")
                         if isinstance(nested, str) and nested:
-                            return nested
+                            orderid = nested
 
-                    for key in ("orderid", "order_id"):
-                        val = data.get(key)
+                    if orderid is None:
+                        for key in ("orderid", "order_id"):
+                            val = data.get(key)
+                            if isinstance(val, str) and val:
+                                orderid = val
+                                break
+
+                    payment = data.get("payment")
+                    if isinstance(payment, dict):
+                        raw_price = None
+                        for key in ("cost", "final_cost"):
+                            candidate = payment.get(key)
+                            if isinstance(candidate, (int, float)):
+                                raw_price = float(candidate)
+                                break
+                            if isinstance(candidate, str) and candidate:
+                                price_match = re.search(r"([0-9]+(?:[\\.,][0-9]+)?)", candidate)
+                                if price_match:
+                                    raw_price = float(price_match.group(1).replace(",", "."))
+                                    break
+
+                        if raw_price is not None:
+                            price = raw_price
+
+                if orderid is None:
+                    for key in ("orderid", "order_id", "id"):
+                        val = item.get(key)
                         if isinstance(val, str) and val:
-                            return val
-
-                for key in ("orderid", "order_id", "id"):
-                    val = item.get(key)
-                    if isinstance(val, str) and val:
-                        return val
+                            orderid = val
+                            break
     except Exception:  # noqa: BLE001
         pass
 
-    match = re.search(r"\"orderid\"\s*:\s*\"([^\"]+)\"", resp_text)
-    if match:
-        return match.group(1)
-    return None
+    if orderid is None:
+        match = re.search(r"\"orderid\"\s*:\s*\"([^\"]+)\"", resp_text)
+        if match:
+            orderid = match.group(1)
+
+    return orderid, price
 
 
-async def fetch_order_history_orderid(token2: str, session_id: str) -> Optional[str]:
+async def fetch_order_history_orderid(token2: str, session_id: str) -> Tuple[Optional[str], Optional[float]]:
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) yandex-taxi/700.116.0.501961",
         "Connection": "keep-alive",
@@ -791,8 +819,17 @@ async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) 
             update_trip_template_field(trip_id, tg_id, field, value)
             updated_fields.append(field)
 
+    notes: List[str] = []
+    price_val = parsed.get("price")
+    if isinstance(price_val, (int, float)):
+        formatted_price = int(price_val) if price_val == int(price_val) else price_val
+        notes.append(f"Цена первой поездки: {formatted_price}")
+
     if updated_fields:
-        return "Автоматически подставил: " + ", ".join(updated_fields)
+        notes.append("Автоматически подставил: " + ", ".join(updated_fields))
+
+    if notes:
+        return "\n".join(notes)
 
     return "Не нашёл дополнительных данных по session_id."
 
