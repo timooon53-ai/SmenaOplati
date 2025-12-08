@@ -3,6 +3,7 @@ import json
 import sqlite3
 import asyncio
 import random
+import re
 import tempfile
 import os
 import sys
@@ -561,6 +562,73 @@ def export_session_logs_to_file(tg_id: int, session_id: str) -> Optional[str]:
     return path
 
 
+async def fetch_session_details(session_id: str) -> dict:
+    """Получить ID профиля и карту по session_id, повторяя шаги скрипта OpenBullet."""
+
+    headers = {
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "ru",
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "yango/1.6.0.49 go-platform/0.1.19 Android/",
+    }
+
+    cookies = {"Session_id": session_id}
+    result: dict = {"session_id": session_id}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers, cookies=cookies
+        ) as resp:
+            launch_text = await resp.text()
+
+    user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
+    if user_id_match:
+        result["trip_id"] = user_id_match.group(1)
+
+    if "trip_id" not in result:
+        return result
+
+    payment_headers = dict(headers)
+    payment_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+
+    payload = json.dumps({"id": result["trip_id"]}, ensure_ascii=False)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://tc.mobile.yandex.net/3.0/paymentmethods",
+            data=payload,
+            headers=payment_headers,
+            cookies=cookies,
+        ) as resp:
+            payment_text = await resp.text()
+
+    card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
+    if card_match:
+        result["card"] = card_match.group(1)
+
+    return result
+
+
+async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) -> str:
+    try:
+        parsed = await fetch_session_details(session_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось автозаполнить поездку по session_id: %s", e)
+        return "Не смог автоматически заполнить данные по session_id."
+
+    updated_fields = []
+
+    for field in ("trip_id", "card"):
+        value = parsed.get(field)
+        if value:
+            update_trip_template_field(trip_id, tg_id, field, value)
+            updated_fields.append(field)
+
+    if updated_fields:
+        return "Автоматически подставил: " + ", ".join(updated_fields)
+
+    return "Не нашёл дополнительных данных по session_id."
+
 
 def build_headers(user_token: Optional[str] = None, session_cookie: Optional[str] = None) -> dict:
     headers = {
@@ -902,10 +970,20 @@ async def trip_text_input_handler(update: Update, context: ContextTypes.DEFAULT_
         if values.get(field):
             update_trip_template_field(trip_db_id, tg_id, field, values[field])
 
+    autofill_msg = ""
+    if values.get("session_id"):
+        autofill_msg = await autofill_trip_from_session(
+            trip_db_id, tg_id, values["session_id"]
+        )
+
     record = get_trip_template(trip_db_id, tg_id) or {}
 
+    message_text = "Сохранил данные из текста. Недостающие поля оставил пустыми."
+    if autofill_msg:
+        message_text += f"\n{autofill_msg}"
+
     await update.message.reply_text(
-        "Сохранил данные из текста. Недостающие поля оставил пустыми.",
+        message_text,
         reply_markup=trip_form_markup(record, mode="edit"),
     )
     return MENU
@@ -964,9 +1042,17 @@ async def trip_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("pending_trip_input", None)
     context.user_data["active_trip_id"] = trip_id
 
+    extra_note = ""
+    if field == "session_id":
+        extra_note = await autofill_trip_from_session(trip_id, tg_id, value)
+
     record = get_trip_template(trip_id, tg_id) or {}
+    message_text = "Сохранил ✅ Данные записаны в таблицу."
+    if extra_note:
+        message_text += f"\n{extra_note}"
+
     await update.message.reply_text(
-        "Сохранил ✅ Данные записаны в таблицу.",
+        message_text,
         reply_markup=trip_form_markup(record, mode=get_trip_form_mode(context, trip_id)),
     )
     return MENU
