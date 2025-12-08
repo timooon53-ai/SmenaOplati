@@ -3,6 +3,7 @@ import json
 import sqlite3
 import asyncio
 import random
+import re
 import tempfile
 import os
 import sys
@@ -561,6 +562,227 @@ def export_session_logs_to_file(tg_id: int, session_id: str) -> Optional[str]:
     return path
 
 
+async def fetch_session_details(session_id: str) -> dict:
+    """Получить ID профиля и карту по session_id, повторяя шаги скрипта OpenBullet."""
+
+    headers = {
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "ru",
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "yango/1.6.0.49 go-platform/0.1.19 Android/",
+    }
+
+    cookies = {"Session_id": session_id}
+    result: dict = {"session_id": session_id}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers, cookies=cookies
+        ) as resp:
+            launch_text = await resp.text()
+
+    user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
+    if user_id_match:
+        result["trip_id"] = user_id_match.group(1)
+
+    if "trip_id" not in result:
+        return result
+
+    payment_headers = dict(headers)
+    payment_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+
+    payload = json.dumps({"id": result["trip_id"]}, ensure_ascii=False)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://tc.mobile.yandex.net/3.0/paymentmethods",
+            data=payload,
+            headers=payment_headers,
+            cookies=cookies,
+        ) as resp:
+            payment_text = await resp.text()
+
+    card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
+    if card_match:
+        result["card"] = card_match.group(1)
+
+    token2 = await fetch_token2(session_id)
+    if token2:
+        orderid = await fetch_order_history_orderid(token2, session_id)
+        if orderid:
+            result["orderid"] = orderid
+
+    return result
+
+
+def _generate_random_user_id() -> str:
+    letters = [random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5)]
+    digits = [random.choice("0123456789") for _ in range(5)]
+    mixed = letters + digits
+    random.shuffle(mixed)
+    return "".join(mixed)
+
+
+async def fetch_token2(session_id: str) -> Optional[str]:
+    headers = {
+        "Host": "mobileproxy.passport.yandex.net",
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Content-Length": "125",
+        "User-Agent": "com.yandex.mobile.auth.sdk/6.20.9.1147 (Apple iPhone15,3; iOS 17.0.2)",
+        "Accept-Language": "ru-RU;q=1",
+        "Ya-Client-Host": "yandex.ru",
+        "Ya-Client-Cookie": f"Session_id={session_id}",
+    }
+
+    data = (
+        "client_id=c0ebe342af7d48fbbbfcf2d2eedb8f9e&client_secret=ad0a908f0aa341a182a37ecd75bc319e"
+        "&grant_type=sessionid&host=yandex.ru"
+    )
+
+    access_token = None
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
+            data=data,
+            headers=headers,
+        ) as resp:
+            resp_text = await resp.text()
+
+    token_match = re.search(r"\"access_token\":\"([^\"]+)\"", resp_text)
+    if token_match:
+        access_token = token_match.group(1)
+    if not access_token:
+        return None
+
+    token_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+        "Pragma": "no-cache",
+        "Accept": "*/*",
+    }
+
+    token_payload = (
+        "grant_type=x-token"
+        f"&access_token={access_token}"
+        "&client_id=f576990d844e48289d8bc0dd4f113bb9"
+        "&client_secret=c6fa15d74ddf4d7ea427b2f712799e9b"
+        "&payment_auth_retpath=https%3A%2F%2Fpassport.yandex.ru%2Fclosewebview"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://mobileproxy.passport.yandex.net/1/token",
+            data=token_payload,
+            headers=token_headers,
+        ) as resp:
+            token_resp_text = await resp.text()
+
+    token2_match = re.search(r"\"access_token\": ?\"([^\"]+)\"", token_resp_text)
+    if token2_match:
+        return token2_match.group(1)
+    return None
+
+
+def _extract_orderid_from_history(resp_text: str) -> Optional[str]:
+    try:
+        payload = json.loads(resp_text)
+        orders = (
+            payload.get("orders")
+            or payload.get("result", {}).get("orders")
+            or payload.get("data", {}).get("orders")
+        )
+        if isinstance(orders, list):
+            for item in orders:
+                if isinstance(item, dict):
+                    for key in ("orderid", "order_id", "id"):
+                        val = item.get(key)
+                        if isinstance(val, str) and val:
+                            return val
+    except Exception:  # noqa: BLE001
+        pass
+
+    match = re.search(r"\"orderid\"\s*:\s*\"([^\"]+)\"", resp_text)
+    if match:
+        return match.group(1)
+    return None
+
+
+async def fetch_order_history_orderid(token2: str, session_id: str) -> Optional[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) yandex-taxi/700.116.0.501961",
+        "Connection": "keep-alive",
+        "Authorization": f"Bearer {token2}",
+        "X-YaTaxi-UserId": _generate_random_user_id(),
+        "Cookie": f"Session_id={session_id}",
+    }
+
+    body = {
+        "services": {
+            "taxi": {"image_tags": {"size_hint": 9999}, "flavors": ["default"]},
+            "eats": {},
+            "grocery": {},
+            "grocery_b2b": {},
+            "drive": {},
+            "scooters": {},
+            "qr_pay": {},
+            "shuttle": {},
+            "market": {},
+            "market_locals": {},
+            "delivery": {},
+            "korzinkago": {},
+            "dealcart": {},
+            "naheed": {},
+            "almamarket": {},
+            "supermarketaz": {},
+            "chargers": {},
+            "cartech": {},
+            "afisha": {},
+            "masstransit": {},
+            "shop": {},
+            "pharma": {},
+            "ambulance": {},
+            "places_bookings": {},
+            "buy_sell": {},
+        },
+        "range": {"results": 20},
+        "country_code": "RU",
+        "include_service_metadata": True,
+        "is_updated_masstransit_history_available": True,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://m.taxi.yandex.ru/order-history-frontend/api/4.0/orderhistory/v2/list",
+            json=body,
+            headers=headers,
+        ) as resp:
+            resp_text = await resp.text()
+
+    return _extract_orderid_from_history(resp_text)
+
+
+async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) -> str:
+    try:
+        parsed = await fetch_session_details(session_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось автозаполнить поездку по session_id: %s", e)
+        return "Не смог автоматически заполнить данные по session_id."
+
+    updated_fields = []
+
+    for field in ("trip_id", "card", "orderid"):
+        value = parsed.get(field)
+        if value:
+            update_trip_template_field(trip_id, tg_id, field, value)
+            updated_fields.append(field)
+
+    if updated_fields:
+        return "Автоматически подставил: " + ", ".join(updated_fields)
+
+    return "Не нашёл дополнительных данных по session_id."
+
 
 def build_headers(user_token: Optional[str] = None, session_cookie: Optional[str] = None) -> dict:
     headers = {
@@ -902,10 +1124,20 @@ async def trip_text_input_handler(update: Update, context: ContextTypes.DEFAULT_
         if values.get(field):
             update_trip_template_field(trip_db_id, tg_id, field, values[field])
 
+    autofill_msg = ""
+    if values.get("session_id"):
+        autofill_msg = await autofill_trip_from_session(
+            trip_db_id, tg_id, values["session_id"]
+        )
+
     record = get_trip_template(trip_db_id, tg_id) or {}
 
+    message_text = "Сохранил данные из текста. Недостающие поля оставил пустыми."
+    if autofill_msg:
+        message_text += f"\n{autofill_msg}"
+
     await update.message.reply_text(
-        "Сохранил данные из текста. Недостающие поля оставил пустыми.",
+        message_text,
         reply_markup=trip_form_markup(record, mode="edit"),
     )
     return MENU
@@ -964,9 +1196,17 @@ async def trip_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("pending_trip_input", None)
     context.user_data["active_trip_id"] = trip_id
 
+    extra_note = ""
+    if field == "session_id":
+        extra_note = await autofill_trip_from_session(trip_id, tg_id, value)
+
     record = get_trip_template(trip_id, tg_id) or {}
+    message_text = "Сохранил ✅ Данные записаны в таблицу."
+    if extra_note:
+        message_text += f"\n{extra_note}"
+
     await update.message.reply_text(
-        "Сохранил ✅ Данные записаны в таблицу.",
+        message_text,
         reply_markup=trip_form_markup(record, mode=get_trip_form_mode(context, trip_id)),
     )
     return MENU
