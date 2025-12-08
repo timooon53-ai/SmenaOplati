@@ -693,13 +693,26 @@ def _extract_orderid_from_history(resp_text: str) -> Optional[str]:
             or payload.get("result", {}).get("orders")
             or payload.get("data", {}).get("orders")
         )
-        if isinstance(orders, list):
-            for item in orders:
-                if isinstance(item, dict):
-                    for key in ("orderid", "order_id", "id"):
-                        val = item.get(key)
+        if isinstance(orders, list) and orders:
+            item = orders[0]
+            if isinstance(item, dict):
+                data = item.get("data")
+                if isinstance(data, dict):
+                    item_id = data.get("item_id")
+                    if isinstance(item_id, dict):
+                        nested = item_id.get("order_id") or item_id.get("orderid")
+                        if isinstance(nested, str) and nested:
+                            return nested
+
+                    for key in ("orderid", "order_id"):
+                        val = data.get(key)
                         if isinstance(val, str) and val:
                             return val
+
+                for key in ("orderid", "order_id", "id"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val:
+                        return val
     except Exception:  # noqa: BLE001
         pass
 
