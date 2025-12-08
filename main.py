@@ -644,17 +644,32 @@ def _pretty_json_or_text(raw: str) -> str:
         return raw
 
 
+def _trim_text(text: str, max_len: int = 1200) -> str:
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
 def _format_debug_responses(responses: Optional[list]) -> str:
     if not isinstance(responses, list) or not responses:
         return ""
 
     chunks = ["Ответы запросов (JSON):"]
+    total_len = 0
+
     for entry in responses:
         if not isinstance(entry, dict):
             continue
         step = entry.get("step") or "request"
-        body = entry.get("response") or ""
-        chunks.append(f"{step}:\n```json\n{body}\n```")
+        body = _trim_text(entry.get("response") or "", 1200)
+        chunk = f"{step}:\n```json\n{body}\n```"
+        total_len += len(chunk)
+        if total_len > 3500:
+            chunks.append("[вывод обрезан, чтобы пройти ограничение Telegram]")
+            break
+        chunks.append(chunk)
 
     return "\n".join(chunks)
 
@@ -725,6 +740,21 @@ def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Option
     orderid: Optional[str] = None
     price: Optional[float] = None
 
+    def _deep_search_for_orderid(obj) -> Optional[str]:
+        stack = [obj]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for key, val in current.items():
+                    if key in {"orderid", "order_id", "id"} and isinstance(val, (str, int)):
+                        if str(val):
+                            return str(val)
+                    if isinstance(val, (dict, list)):
+                        stack.append(val)
+            elif isinstance(current, list):
+                stack.extend(current)
+        return None
+
     try:
         payload = json.loads(resp_text)
         orders = (
@@ -773,6 +803,9 @@ def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Option
                         if isinstance(val, (str, int)) and val:
                             orderid = str(val)
                             break
+
+                if orderid is None:
+                    orderid = _deep_search_for_orderid(item)
     except Exception:  # noqa: BLE001
         pass
 
