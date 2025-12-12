@@ -38,6 +38,7 @@ ALLOWED_USER_IDS: Final = {7515876699, 966094117, 7846689040, 8143695937}
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
 DB_PATH: Final = "bot.db"
+MIKE_DB_PATH: Final = r"C:\\Users\\Administrator\\PycharmProjects\\UpdatePriemZakazov\\db\\DB.bd"
 PROXY_FILE: Final = "proxy.txt"
 
 (
@@ -353,6 +354,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS trip_templates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tg_id INTEGER NOT NULL,
+            trip_name TEXT,
             token2 TEXT,
             trip_id TEXT,
             card TEXT,
@@ -366,6 +368,11 @@ def init_db():
 
     try:
         cur.execute("ALTER TABLE trip_templates ADD COLUMN session_id TEXT;")
+    except sqlite3.OperationalError:
+        pass  # уже есть
+
+    try:
+        cur.execute("ALTER TABLE trip_templates ADD COLUMN trip_name TEXT;")
     except sqlite3.OperationalError:
         pass  # уже есть
 
@@ -435,7 +442,7 @@ def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, token2, trip_id, card, orderid, trip_link, session_id
+        SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, session_id
         FROM trip_templates
         WHERE id = ? AND tg_id = ?
         LIMIT 1;
@@ -445,13 +452,30 @@ def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
     row = cur.fetchone()
     conn.close()
     if row:
-        keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link", "session_id"]
+        keys = [
+            "id",
+            "trip_name",
+            "token2",
+            "trip_id",
+            "card",
+            "orderid",
+            "trip_link",
+            "session_id",
+        ]
         return dict(zip(keys, row))
     return None
 
 
 def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str) -> None:
-    if field not in {"token2", "trip_id", "card", "orderid", "trip_link", "session_id"}:
+    if field not in {
+        "trip_name",
+        "token2",
+        "trip_id",
+        "card",
+        "orderid",
+        "trip_link",
+        "session_id",
+    }:
         return
     conn = get_conn()
     cur = conn.cursor()
@@ -480,7 +504,7 @@ def list_trip_templates(tg_id: int) -> List[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, token2, trip_id, card, orderid, trip_link, session_id, created_at
+        SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, session_id, created_at
         FROM trip_templates
         WHERE tg_id = ?
         ORDER BY id DESC;
@@ -489,7 +513,17 @@ def list_trip_templates(tg_id: int) -> List[dict]:
     )
     rows = cur.fetchall()
     conn.close()
-    keys = ["id", "token2", "trip_id", "card", "orderid", "trip_link", "session_id", "created_at"]
+    keys = [
+        "id",
+        "trip_name",
+        "token2",
+        "trip_id",
+        "card",
+        "orderid",
+        "trip_link",
+        "session_id",
+        "created_at",
+    ]
     return [dict(zip(keys, row)) for row in rows]
 
 
@@ -501,13 +535,77 @@ def delete_trip_template(trip_id: int, tg_id: int) -> None:
     conn.close()
 
 
+def fetch_mike_orders() -> List[dict]:
+    if not os.path.exists(MIKE_DB_PATH):
+        return []
+
+    conn = sqlite3.connect(MIKE_DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM orders_info ORDER BY id DESC;")
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+
+    orders = []
+    for row in rows:
+        try:
+            orders.append(
+                {
+                    "row_id": row[0],
+                    "order_id_primary": row[3],
+                    "token2": row[4],
+                    "card": row[5],
+                    "orderid": row[6],
+                    "trip_link": row[7],
+                    "created_at": row[9],
+                }
+            )
+        except Exception:  # noqa: BLE001
+            continue
+
+    return orders
+
+
+def fetch_mike_order_by_id(row_id: int) -> Optional[dict]:
+    if not os.path.exists(MIKE_DB_PATH):
+        return None
+
+    conn = sqlite3.connect(MIKE_DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM orders_info WHERE id = ? LIMIT 1;", (row_id,))
+        row = cur.fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    conn.close()
+
+    if not row:
+        return None
+
+    try:
+        return {
+            "row_id": row[0],
+            "order_id_primary": row[3],
+            "token2": row[4],
+            "card": row[5],
+            "orderid": row[6],
+            "trip_link": row[7],
+            "created_at": row[9],
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def clear_trip_template(trip_id: int, tg_id: int) -> None:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         UPDATE trip_templates
-        SET token2 = NULL,
+        SET trip_name = NULL,
+            token2 = NULL,
             trip_id = NULL,
             card = NULL,
             orderid = NULL,
@@ -519,6 +617,31 @@ def clear_trip_template(trip_id: int, tg_id: int) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def import_mike_order_to_trip(order: dict, tg_id: int) -> Optional[int]:
+    if not order:
+        return None
+
+    trip_db_id = create_trip_template(tg_id)
+
+    title = order.get("created_at") or f"Майк #{order.get('row_id')}"
+    if title:
+        update_trip_template_field(trip_db_id, tg_id, "trip_name", str(title))
+
+    mappings = {
+        "trip_id": order.get("order_id_primary") or "",
+        "token2": order.get("token2") or "",
+        "card": order.get("card") or "",
+        "orderid": order.get("orderid") or "",
+        "trip_link": order.get("trip_link") or "",
+    }
+
+    for field, val in mappings.items():
+        if val:
+            update_trip_template_field(trip_db_id, tg_id, field, str(val))
+
+    return trip_db_id
 
 
 def export_session_logs_to_file(tg_id: int, session_id: str) -> Optional[str]:
@@ -624,6 +747,60 @@ async def fetch_session_details(session_id: str) -> dict:
             result["orderid"] = orderid
         if price is not None:
             result["price"] = price
+
+    return result
+
+
+async def fetch_trip_details_from_token(token2: str) -> dict:
+    """Получить ID профиля и карту по token2 через авторизационный заголовок."""
+
+    headers = {
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "ru",
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "yango/1.6.0.49 go-platform/0.1.19 Android/",
+        "Authorization": f"Bearer {token2}",
+    }
+
+    result: dict = {"token2": token2, "_debug_responses": []}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers
+        ) as resp:
+            launch_text = await resp.text()
+
+    result["_debug_responses"].append(
+        {"step": "launch", "response": _pretty_json_or_text(launch_text)}
+    )
+
+    user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
+    if user_id_match:
+        result["trip_id"] = user_id_match.group(1)
+
+    if "trip_id" not in result:
+        return result
+
+    payment_headers = dict(headers)
+    payment_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+
+    payload = json.dumps({"id": result["trip_id"]}, ensure_ascii=False)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://tc.mobile.yandex.net/3.0/paymentmethods",
+            data=payload,
+            headers=payment_headers,
+        ) as resp:
+            payment_text = await resp.text()
+
+    result["_debug_responses"].append(
+        {"step": "paymentmethods", "response": _pretty_json_or_text(payment_text)}
+    )
+
+    card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
+    if card_match:
+        result["card"] = card_match.group(1)
 
     return result
 
@@ -913,6 +1090,35 @@ async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) 
     return "Не нашёл дополнительных данных по session_id."
 
 
+async def autofill_trip_from_token(trip_id: int, tg_id: int, token2: str) -> str:
+    try:
+        parsed = await fetch_trip_details_from_token(token2)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось автозаполнить поездку по token2: %s", e)
+        return "Не смог автоматически заполнить данные по token2."
+
+    updated_fields = []
+
+    for field in ("trip_id", "card"):
+        value = parsed.get(field)
+        if value:
+            update_trip_template_field(trip_id, tg_id, field, value)
+            updated_fields.append(field)
+
+    notes: List[str] = []
+    if updated_fields:
+        notes.append("Автоматически подставил: " + ", ".join(updated_fields))
+
+    debug_block = _format_debug_responses(parsed.get("_debug_responses"))
+    if debug_block:
+        notes.append(debug_block)
+
+    if notes:
+        return "\n".join(notes)
+
+    return "Не нашёл дополнительных данных по token2."
+
+
 def build_headers(user_token: Optional[str] = None, session_cookie: Optional[str] = None) -> dict:
     headers = {
         "Accept-Encoding": "gzip, deflate, br",
@@ -1118,13 +1324,27 @@ def pop_trip_return_target(context: ContextTypes.DEFAULT_TYPE, trip_id: int) -> 
 def _trip_has_values(record: dict) -> bool:
     return any(
         record.get(field)
-        for field in ("token2", "session_id", "trip_id", "card", "orderid", "trip_link")
+        for field in (
+            "trip_name",
+            "token2",
+            "session_id",
+            "trip_id",
+            "card",
+            "orderid",
+            "trip_link",
+        )
     )
 
 
 def trip_form_markup(record: dict, *, mode: str = "create") -> InlineKeyboardMarkup:
     trip_id = record.get("id")
     buttons = [
+        [
+            InlineKeyboardButton(
+                f"{_field_icon(record.get('trip_name'))} название",
+                callback_data=f"tripfield:{trip_id}:trip_name",
+            )
+        ],
         [
             InlineKeyboardButton(
                 f"{_field_icon(record.get('token2'))} token2",
@@ -1258,6 +1478,10 @@ async def trip_text_input_handler(update: Update, context: ContextTypes.DEFAULT_
         autofill_msg = await autofill_trip_from_session(
             trip_db_id, tg_id, values["session_id"]
         )
+    elif values.get("token2"):
+        autofill_msg = await autofill_trip_from_token(
+            trip_db_id, tg_id, values["token2"]
+        )
 
     record = get_trip_template(trip_db_id, tg_id) or {}
 
@@ -1290,6 +1514,7 @@ async def tripfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     }
 
     field_names = {
+        "trip_name": "название",
         "token2": "token2",
         "session_id": "session_id",
         "trip_id": "ID",
@@ -1328,6 +1553,8 @@ async def trip_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     extra_note = ""
     if field == "session_id":
         extra_note = await autofill_trip_from_session(trip_id, tg_id, value)
+    elif field == "token2":
+        extra_note = await autofill_trip_from_token(trip_id, tg_id, value)
 
     record = get_trip_template(trip_id, tg_id) or {}
     message_text = "Сохранил ✅ Данные записаны в таблицу."
@@ -1357,7 +1584,7 @@ async def send_trip_templates_list(
     keyboard = [
         [
             InlineKeyboardButton(
-                f"#{t['id']} | {t.get('orderid') or 'orderid не задан'}",
+                f"#{t['id']} | {t.get('trip_name') or t.get('orderid') or 'без названия'}",
                 callback_data=f"tripselect:{t['id']}",
             )
         ]
@@ -1396,7 +1623,7 @@ async def send_trip_manager_list(chat, tg_id: int, context: ContextTypes.DEFAULT
     keyboard = [
         [
             InlineKeyboardButton(
-                f"🧳 #{t['id']} | {t.get('orderid') or 'orderid не задан'}",
+                f"🧳 #{t['id']} | {t.get('trip_name') or t.get('orderid') or 'без названия'}",
                 callback_data=f"tripmanage:{t['id']}",
             )
         ]
@@ -1497,36 +1724,34 @@ async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Не нашёл такую запись в БД.")
         return MENU
 
-    text_lines = [
-        f"🆔 ID записи: {record['id']}",
-        f"🔑 token2: {record.get('token2') or '—'}",
-        f"🍪 session_id: {record.get('session_id') or '—'}",
-        f"🪪 ID: {record.get('trip_id') or '—'}",
-        f"💳 card-x: {record.get('card') or '—'}",
-        f"📄 orderid: {record.get('orderid') or '—'}",
-        f"🔗 Ссылка: {record.get('trip_link') or '—'}",
-    ]
+    token = record.get("token2")
+    session_cookie = record.get("session_id")
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🚀 Использовать в смене", callback_data=f"tripuse:{record['id']}"
-                ),
-                InlineKeyboardButton(
-                    "🗑️ Удалить из БД", callback_data=f"tripdelete:{record['id']}"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "✏️ Редактировать", callback_data=f"tripedit:{record['id']}"
-                )
-            ],
-        ]
+    if not token and not session_cookie:
+        await query.message.reply_text(
+            "В этой поездке не задан token2 или session_id. Заполни хотя бы одно поле и попробуй снова.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    if session_cookie:
+        context.user_data["session_cookie"] = session_cookie
+        context.user_data.pop("token", None)
+    else:
+        context.user_data["token"] = token
+        context.user_data.pop("session_cookie", None)
+
+    context.user_data["orderid"] = record.get("orderid")
+    context.user_data["card"] = record.get("card")
+    context.user_data["id"] = record.get("trip_id")
+
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="Данные перенесены в смену. Сколько потоков запустить?",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
-    await query.message.reply_text("\n".join(text_lines), reply_markup=keyboard)
-    return MENU
+    return ASK_THREADS
 
 
 @require_access
@@ -1566,6 +1791,7 @@ async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text_lines = [
         f"🆔 ID записи: {record['id']}",
+        f"🏷️ Название: {record.get('trip_name') or '—'}",
         f"🔑 token2: {record.get('token2') or '—'}",
         f"🍪 session_id: {record.get('session_id') or '—'}",
         f"🪪 ID: {record.get('trip_id') or '—'}",
@@ -2059,10 +2285,149 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg += "\nКнопка «Логи последней сессии» сразу скинет .txt по последней сессии."
 
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Добавить из Майка", callback_data="mike:list")]]
+    )
+
     await update.message.reply_text(
         msg,
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=keyboard,
+    )
+    return MENU
+
+
+async def send_mike_orders_list(chat, tg_id: int):
+    orders = fetch_mike_orders()
+
+    if not os.path.exists(MIKE_DB_PATH):
+        await chat.reply_text(
+            "Файл базы из Майка не найден. Проверь путь: " f"{MIKE_DB_PATH}",
+            reply_markup=main_keyboard(),
+        )
+        return False
+
+    if not orders:
+        await chat.reply_text(
+            "Не удалось прочитать поездки из Майка или таблица пуста.",
+            reply_markup=main_keyboard(),
+        )
+        return False
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                order.get("created_at") or f"Запись #{order['row_id']}",
+                callback_data=f"mike:item:{order['row_id']}",
+            )
+        ]
+        for order in orders
+    ]
+
+    await chat.reply_text(
+        "Выбери поездку из базы Майка:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+    return True
+
+
+@require_access
+async def mike_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await send_mike_orders_list(query.message, update.effective_user.id)
+    return MENU
+
+
+@require_access
+async def mike_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, _, row_id_str = query.data.split(":", 2)
+        row_id = int(row_id_str)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text(
+            "Не понял, какую запись открыть.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    order = fetch_mike_order_by_id(row_id)
+    if not order:
+        await query.message.reply_text(
+            "Не смог получить данные этой записи из Майка.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    text_lines = [
+        f"🆔 Запись: {order.get('row_id')}",
+        f"🏷️ Название: {order.get('created_at') or '—'}",
+        f"🔑 token2: {order.get('token2') or '—'}",
+        f"🪪 ID: {order.get('order_id_primary') or '—'}",
+        f"💳 card-x: {order.get('card') or '—'}",
+        f"📄 orderid: {order.get('orderid') or '—'}",
+        f"🔗 Ссылка: {order.get('trip_link') or '—'}",
+    ]
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Добавить в мои поездки",
+                    callback_data=f"mike:add:{order['row_id']}",
+                )
+            ],
+            [InlineKeyboardButton("↩️ Назад", callback_data="mike:list")],
+        ]
+    )
+
+    await query.message.reply_text("\n".join(text_lines), reply_markup=keyboard)
+    return MENU
+
+
+@require_access
+async def mike_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, _, row_id_str = query.data.split(":", 2)
+        row_id = int(row_id_str)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text(
+            "Не понял, какую запись добавить.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.message.reply_text(
+            "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    order = fetch_mike_order_by_id(row_id)
+    if not order:
+        await query.message.reply_text(
+            "Не удалось прочитать запись из базы Майка.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    trip_id = import_mike_order_to_trip(order, tg_id)
+    if not trip_id:
+        await query.message.reply_text(
+            "Не смог добавить поездку.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    await query.message.reply_text(
+        "Поездка добавлена в твой список.", reply_markup=main_keyboard()
     )
     return MENU
 
@@ -2464,6 +2829,9 @@ def main():
                 CallbackQueryHandler(trip_new_callback, pattern="^tripnew:"),
                 CallbackQueryHandler(trip_edit_callback, pattern="^tripedit:"),
                 CallbackQueryHandler(trip_delete_callback, pattern="^tripdelete:"),
+                CallbackQueryHandler(mike_add_callback, pattern="^mike:add:"),
+                CallbackQueryHandler(mike_item_callback, pattern="^mike:item:"),
+                CallbackQueryHandler(mike_list_callback, pattern="^mike:list"),
                 CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
                 CallbackQueryHandler(start_choice_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
