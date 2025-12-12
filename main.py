@@ -573,13 +573,17 @@ async def fetch_session_details(session_id: str) -> dict:
     }
 
     cookies = {"Session_id": session_id}
-    result: dict = {"session_id": session_id}
+    result: dict = {"session_id": session_id, "_debug_responses": []}
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers, cookies=cookies
         ) as resp:
             launch_text = await resp.text()
+
+    result["_debug_responses"].append(
+        {"step": "launch", "response": _pretty_json_or_text(launch_text)}
+    )
 
     user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
     if user_id_match:
@@ -602,11 +606,277 @@ async def fetch_session_details(session_id: str) -> dict:
         ) as resp:
             payment_text = await resp.text()
 
+    result["_debug_responses"].append(
+        {"step": "paymentmethods", "response": _pretty_json_or_text(payment_text)}
+    )
+
     card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
     if card_match:
         result["card"] = card_match.group(1)
 
+    token2 = await fetch_token2(session_id)
+    if token2:
+        orderid, price, history_resp = await fetch_order_history_orderid(token2, session_id)
+        result["_debug_responses"].append(
+            {"step": "order_history", "response": _pretty_json_or_text(history_resp)}
+        )
+        if orderid:
+            result["orderid"] = orderid
+        if price is not None:
+            result["price"] = price
+
     return result
+
+
+def _generate_random_user_id() -> str:
+    letters = [random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5)]
+    digits = [random.choice("0123456789") for _ in range(5)]
+    mixed = letters + digits
+    random.shuffle(mixed)
+    return "".join(mixed)
+
+
+def _pretty_json_or_text(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        return raw
+
+
+def _trim_text(text: str, max_len: int = 1200) -> str:
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _format_debug_responses(responses: Optional[list]) -> str:
+    if not isinstance(responses, list) or not responses:
+        return ""
+
+    chunks = ["Ответы запросов (JSON):"]
+    total_len = 0
+
+    for entry in responses:
+        if not isinstance(entry, dict):
+            continue
+        step = entry.get("step") or "request"
+        body = _trim_text(entry.get("response") or "", 1200)
+        chunk = f"{step}:\n```json\n{body}\n```"
+        total_len += len(chunk)
+        if total_len > 3500:
+            chunks.append("[вывод обрезан, чтобы пройти ограничение Telegram]")
+            break
+        chunks.append(chunk)
+
+    return "\n".join(chunks)
+
+
+async def fetch_token2(session_id: str) -> Optional[str]:
+    headers = {
+        "Host": "mobileproxy.passport.yandex.net",
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Content-Length": "125",
+        "User-Agent": "com.yandex.mobile.auth.sdk/6.20.9.1147 (Apple iPhone15,3; iOS 17.0.2)",
+        "Accept-Language": "ru-RU;q=1",
+        "Ya-Client-Host": "yandex.ru",
+        "Ya-Client-Cookie": f"Session_id={session_id}",
+    }
+
+    data = (
+        "client_id=c0ebe342af7d48fbbbfcf2d2eedb8f9e&client_secret=ad0a908f0aa341a182a37ecd75bc319e"
+        "&grant_type=sessionid&host=yandex.ru"
+    )
+
+    access_token = None
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
+            data=data,
+            headers=headers,
+        ) as resp:
+            resp_text = await resp.text()
+
+    token_match = re.search(r"\"access_token\":\"([^\"]+)\"", resp_text)
+    if token_match:
+        access_token = token_match.group(1)
+    if not access_token:
+        return None
+
+    token_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+        "Pragma": "no-cache",
+        "Accept": "*/*",
+    }
+
+    token_payload = (
+        "grant_type=x-token"
+        f"&access_token={access_token}"
+        "&client_id=f576990d844e48289d8bc0dd4f113bb9"
+        "&client_secret=c6fa15d74ddf4d7ea427b2f712799e9b"
+        "&payment_auth_retpath=https%3A%2F%2Fpassport.yandex.ru%2Fclosewebview"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://mobileproxy.passport.yandex.net/1/token",
+            data=token_payload,
+            headers=token_headers,
+        ) as resp:
+            token_resp_text = await resp.text()
+
+    token2_match = re.search(r"\"access_token\": ?\"([^\"]+)\"", token_resp_text)
+    if token2_match:
+        return token2_match.group(1)
+    return None
+
+
+def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Optional[float]]:
+    orderid: Optional[str] = None
+    price: Optional[float] = None
+
+    def _deep_search_for_orderid(obj) -> Optional[str]:
+        stack = [obj]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for key, val in current.items():
+                    if key in {"orderid", "order_id", "id"} and isinstance(val, (str, int)):
+                        if str(val):
+                            return str(val)
+                    if isinstance(val, (dict, list)):
+                        stack.append(val)
+            elif isinstance(current, list):
+                stack.extend(current)
+        return None
+
+    try:
+        payload = json.loads(resp_text)
+        orders = (
+            payload.get("orders")
+            or payload.get("result", {}).get("orders")
+            or payload.get("data", {}).get("orders")
+        )
+        if isinstance(orders, list) and orders:
+            item = orders[0]
+            if isinstance(item, dict):
+                data = item.get("data")
+                if isinstance(data, dict):
+                    item_id = data.get("item_id")
+                    if isinstance(item_id, dict):
+                        nested = item_id.get("order_id") or item_id.get("orderid")
+                        if isinstance(nested, (str, int)) and nested:
+                            orderid = str(nested)
+
+                    if orderid is None:
+                        for key in ("orderid", "order_id"):
+                            val = data.get(key)
+                            if isinstance(val, (str, int)) and val:
+                                orderid = str(val)
+                                break
+
+                    payment = data.get("payment")
+                    if isinstance(payment, dict):
+                        raw_price = None
+                        for key in ("cost", "final_cost"):
+                            candidate = payment.get(key)
+                            if isinstance(candidate, (int, float)):
+                                raw_price = float(candidate)
+                                break
+                            if isinstance(candidate, str) and candidate:
+                                price_match = re.search(r"([0-9]+(?:[\\.,][0-9]+)?)", candidate)
+                                if price_match:
+                                    raw_price = float(price_match.group(1).replace(",", "."))
+                                    break
+
+                        if raw_price is not None:
+                            price = raw_price
+
+                if orderid is None:
+                    for key in ("orderid", "order_id", "id"):
+                        val = item.get(key)
+                        if isinstance(val, (str, int)) and val:
+                            orderid = str(val)
+                            break
+
+                if orderid is None:
+                    orderid = _deep_search_for_orderid(item)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if orderid is None:
+        match = re.search(r"\"orderid\"\s*:\s*\"([^\"]+)\"", resp_text)
+        if match:
+            orderid = match.group(1)
+
+    if orderid is None:
+        match = re.search(r"\"order_id\"\s*:\s*\"([^\"]+)\"", resp_text)
+        if match:
+            orderid = match.group(1)
+
+    return orderid, price
+
+
+async def fetch_order_history_orderid(
+    token2: str, session_id: str
+) -> Tuple[Optional[str], Optional[float], str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) yandex-taxi/700.116.0.501961",
+        "Connection": "keep-alive",
+        "Authorization": f"Bearer {token2}",
+        "X-YaTaxi-UserId": _generate_random_user_id(),
+        "Cookie": f"Session_id={session_id}",
+    }
+
+    body = {
+        "services": {
+            "taxi": {"image_tags": {"size_hint": 9999}, "flavors": ["default"]},
+            "eats": {},
+            "grocery": {},
+            "grocery_b2b": {},
+            "drive": {},
+            "scooters": {},
+            "qr_pay": {},
+            "shuttle": {},
+            "market": {},
+            "market_locals": {},
+            "delivery": {},
+            "korzinkago": {},
+            "dealcart": {},
+            "naheed": {},
+            "almamarket": {},
+            "supermarketaz": {},
+            "chargers": {},
+            "cartech": {},
+            "afisha": {},
+            "masstransit": {},
+            "shop": {},
+            "pharma": {},
+            "ambulance": {},
+            "places_bookings": {},
+            "buy_sell": {},
+        },
+        "range": {"results": 20},
+        "country_code": "RU",
+        "include_service_metadata": True,
+        "is_updated_masstransit_history_available": True,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://m.taxi.yandex.ru/order-history-frontend/api/4.0/orderhistory/v2/list",
+            json=body,
+            headers=headers,
+        ) as resp:
+            resp_text = await resp.text()
+
+    orderid, price = _extract_orderid_from_history(resp_text)
+    return orderid, price, resp_text
 
 
 async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) -> str:
@@ -618,14 +888,27 @@ async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) 
 
     updated_fields = []
 
-    for field in ("trip_id", "card"):
+    for field in ("trip_id", "card", "orderid"):
         value = parsed.get(field)
         if value:
             update_trip_template_field(trip_id, tg_id, field, value)
             updated_fields.append(field)
 
+    notes: List[str] = []
+    price_val = parsed.get("price")
+    if isinstance(price_val, (int, float)):
+        formatted_price = int(price_val) if price_val == int(price_val) else price_val
+        notes.append(f"Цена первой поездки: {formatted_price}")
+
     if updated_fields:
-        return "Автоматически подставил: " + ", ".join(updated_fields)
+        notes.append("Автоматически подставил: " + ", ".join(updated_fields))
+
+    debug_block = _format_debug_responses(parsed.get("_debug_responses"))
+    if debug_block:
+        notes.append(debug_block)
+
+    if notes:
+        return "\n".join(notes)
 
     return "Не нашёл дополнительных данных по session_id."
 
