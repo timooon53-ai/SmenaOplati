@@ -3,6 +3,7 @@ import json
 import sqlite3
 import asyncio
 import random
+import string
 import re
 import tempfile
 import os
@@ -37,7 +38,7 @@ ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
 ALLOWED_USER_IDS: Final = {7515876699, 966094117, 7846689040, 8143695937}
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
-DB_PATH: Final = "bot.db"
+DB_PATH: Final = os.getenv("BOT_DB_PATH", "bot.db")
 MIKE_DB_PATH: Final = r"C:\\Users\\Administrator\\PycharmProjects\\UpdatePriemZakazov\\db\\DB.bd"
 PROXY_FILE: Final = "proxy.txt"
 
@@ -59,7 +60,9 @@ PROXY_FILE: Final = "proxy.txt"
     ASK_STREAM_THREADS,
     ASK_STREAM_TOTAL,
     ASK_TRIP_TEXT,
-) = range(17)
+    ASK_ACCESS_TOKEN,
+    ASK_SCHEDULE_DELAY,
+) = range(19)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -75,30 +78,31 @@ _proxy_lock = threading.Lock()
 
 
 def is_user_allowed(user) -> bool:
-    return user is not None and user.id in ALLOWED_USER_IDS
+    return True
 
 
 async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if is_user_allowed(update.effective_user):
-        return True
-
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Доступ запрещён. Обратись к администратору.",
-        )
-    return False
+    return True
 
 
 def require_access(handler):
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if not await ensure_user_allowed(update, context):
-            return ConversationHandler.END
+            return ASK_ACCESS_TOKEN
         return await handler(update, context, *args, **kwargs)
 
     return wrapper
+
+
+async def delete_callback_message(query):
+    message = getattr(query, "message", None)
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class ChangePaymentClient:
@@ -376,6 +380,22 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # уже есть
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id INTEGER PRIMARY KEY,
+            token TEXT NOT NULL,
+            verified INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 1;")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -411,6 +431,63 @@ def log_request_to_db(
 
     conn.commit()
     conn.close()
+
+
+def random_token(length: int = 10) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.choices(alphabet, k=length))
+
+
+def upsert_user_token(tg_id: int, token: str, verified: bool = True) -> str:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO users (tg_id, token, verified)
+        VALUES (?, ?, ?)
+        ON CONFLICT(tg_id) DO UPDATE SET token = excluded.token, verified = excluded.verified;
+        """,
+        (tg_id, token, int(verified)),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_user_token(tg_id: int) -> Optional[str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT token FROM users WHERE tg_id = ? LIMIT 1;", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return None
+
+
+def token_exists(token: str) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM users WHERE token = ? LIMIT 1;", (token,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def verify_user_by_token(tg_id: int, token: str) -> bool:
+    if not token_exists(token):
+        return False
+    upsert_user_token(tg_id, token, True)
+    return True
+
+
+def is_user_verified(tg_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT verified FROM users WHERE tg_id = ? LIMIT 1;", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row[0])
 
 
 def get_request_count_for_user(tg_id: int) -> int:
@@ -705,7 +782,10 @@ async def fetch_session_details(session_id: str) -> dict:
             launch_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "launch", "response": _pretty_json_or_text(launch_text)}
+        {
+            "step": "launch",
+            "response": f"ID профиля: {result.get('trip_id', '—')}",
+        }
     )
 
     user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
@@ -730,7 +810,10 @@ async def fetch_session_details(session_id: str) -> dict:
             payment_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "paymentmethods", "response": _pretty_json_or_text(payment_text)}
+        {
+            "step": "paymentmethods",
+            "response": f"Карта: {result.get('card', '—')}",
+        }
     )
 
     card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
@@ -771,7 +854,10 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
             launch_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "launch", "response": _pretty_json_or_text(launch_text)}
+        {
+            "step": "launch",
+            "response": f"ID профиля: {result.get('trip_id', '—')}",
+        }
     )
 
     user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
@@ -795,7 +881,10 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
             payment_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "paymentmethods", "response": _pretty_json_or_text(payment_text)}
+        {
+            "step": "paymentmethods",
+            "response": f"Карта: {result.get('card', '—')}",
+        }
     )
 
     card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
@@ -1413,6 +1502,7 @@ async def show_trip_loader(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def trip_load_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     parts = query.data.split(":", 1)
     choice = parts[1] if len(parts) > 1 else ""
 
@@ -1500,6 +1590,7 @@ async def trip_text_input_handler(update: Update, context: ContextTypes.DEFAULT_
 async def tripfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str, field = query.data.split(":", 2)
         trip_id = int(trip_id_str)
@@ -1577,6 +1668,15 @@ def stream_start_markup() -> InlineKeyboardMarkup:
     )
 
 
+def schedule_keyboard(mode: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Отправить сейчас", callback_data=f"schedule:{mode}:now")],
+            [InlineKeyboardButton("Отправить через...", callback_data=f"schedule:{mode}:later")],
+        ]
+    )
+
+
 async def send_trip_templates_list(
     chat, tg_id: int, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1649,6 +1749,7 @@ async def send_trip_manager_list(chat, tg_id: int, context: ContextTypes.DEFAULT
 async def trip_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     parts = query.data.split(":", 1)
     origin = parts[1] if len(parts) > 1 else "list"
@@ -1679,6 +1780,7 @@ async def trip_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     choice = query.data.split(":", 1)[1]
 
     if choice == "create":
@@ -1709,6 +1811,7 @@ async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_
 async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1758,6 +1861,7 @@ async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
     except Exception:  # noqa: BLE001
@@ -1816,6 +1920,7 @@ async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def trip_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1846,6 +1951,7 @@ async def trip_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def trip_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1879,6 +1985,7 @@ async def trip_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def trip_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1910,6 +2017,7 @@ async def trip_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def trip_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1934,6 +2042,7 @@ async def trip_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def trip_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -2104,10 +2213,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+async def access_token_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    tg_id = user.id if user else None
+    token = update.message.text.strip()
+
+    if tg_id is None:
+        await update.message.reply_text(
+            "Не смог получить твой TG ID, попробуй ещё раз позже.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_ACCESS_TOKEN
+
+    if not token:
+        await update.message.reply_text(
+            "Пришли корректный токен (10 символов).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_ACCESS_TOKEN
+
+    if not verify_user_by_token(tg_id, token):
+        await update.message.reply_text(
+            "Токен не найден. Проверь и попробуй снова.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_ACCESS_TOKEN
+
+    await update.message.reply_text(
+        "Отлично! Токен принят, можешь пользоваться ботом.",
+        reply_markup=main_keyboard(),
+    )
+    return MENU
+
+
 @require_access
 async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     choice = query.data
 
     if choice == "single":
@@ -2285,14 +2428,10 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg += "\nКнопка «Логи последней сессии» сразу скинет .txt по последней сессии."
 
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Добавить из Майка", callback_data="mike:list")]]
-    )
-
     await update.message.reply_text(
         msg,
         parse_mode="HTML",
-        reply_markup=keyboard,
+        reply_markup=main_keyboard(),
     )
     return MENU
 
@@ -2336,6 +2475,7 @@ async def send_mike_orders_list(chat, tg_id: int):
 async def mike_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     await send_mike_orders_list(query.message, update.effective_user.id)
     return MENU
@@ -2345,6 +2485,7 @@ async def mike_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def mike_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     try:
         _, _, row_id_str = query.data.split(":", 2)
@@ -2393,6 +2534,7 @@ async def mike_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def mike_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     try:
         _, _, row_id_str = query.data.split(":", 2)
@@ -2814,6 +2956,11 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            ASK_ACCESS_TOKEN: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, access_token_handler
+                )
+            ],
             ASK_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_token)],
             ASK_ORDERID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_orderid)],
             ASK_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_card)],
@@ -2829,9 +2976,6 @@ def main():
                 CallbackQueryHandler(trip_new_callback, pattern="^tripnew:"),
                 CallbackQueryHandler(trip_edit_callback, pattern="^tripedit:"),
                 CallbackQueryHandler(trip_delete_callback, pattern="^tripdelete:"),
-                CallbackQueryHandler(mike_add_callback, pattern="^mike:add:"),
-                CallbackQueryHandler(mike_item_callback, pattern="^mike:item:"),
-                CallbackQueryHandler(mike_list_callback, pattern="^mike:list"),
                 CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
                 CallbackQueryHandler(start_choice_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
