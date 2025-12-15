@@ -2619,7 +2619,108 @@ async def ask_total_requests_handler(update: Update, context: ContextTypes.DEFAU
         )
         return MENU
 
-    await bulk_change_payment(update, context, threads, total_requests)
+    context.user_data["threads"] = threads
+    context.user_data["pending_bulk"] = {
+        "threads": threads,
+        "total": total_requests,
+    }
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Запустить сейчас", callback_data="bulkstart:now")],
+            [InlineKeyboardButton("Запустить через", callback_data="bulkstart:delay")],
+        ]
+    )
+    await update.message.reply_text(
+        "Когда запускать потоки?", reply_markup=keyboard
+    )
+    return ASK_SCHEDULE_DELAY
+
+
+@require_access
+async def bulk_schedule_choice_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    pending = context.user_data.get("pending_bulk") or {}
+    try:
+        _, choice = query.data.split(":", 1)
+    except Exception:  # noqa: BLE001
+        choice = ""
+
+    if not pending:
+        await query.message.reply_text(
+            "Не нашёл сохранённые параметры. Начни заново.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    if choice == "now":
+        await delete_callback_message(query)
+        threads = int(pending.get("threads", context.user_data.get("threads", 1)))
+        total_requests = int(pending.get("total", 0))
+        await query.message.reply_text(
+            "Запускаю массовую отправку прямо сейчас...",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await bulk_change_payment(update, context, threads, total_requests)
+        context.user_data.pop("pending_bulk", None)
+        return MENU
+
+    if choice == "delay":
+        context.user_data["waiting_delay"] = True
+        await query.message.reply_text(
+            "Через сколько минут запустить? Введи число.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_SCHEDULE_DELAY
+
+    await query.message.reply_text("Не понял выбор.", reply_markup=main_keyboard())
+    return MENU
+
+
+@require_access
+async def bulk_schedule_delay_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get("pending_bulk") or {}
+    if not pending:
+        await update.message.reply_text(
+            "Не вижу сохранённых данных. Начни заново.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    text = update.message.text.strip()
+    try:
+        minutes = int(text)
+        if minutes < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Укажи количество минут цифрами (0 или больше).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_SCHEDULE_DELAY
+
+    threads = int(pending.get("threads", context.user_data.get("threads", 1)))
+    total_requests = int(pending.get("total", 0))
+    context.user_data["waiting_delay"] = False
+
+    await update.message.reply_text(
+        f"Запланировал запуск через {minutes} мин. Сообщу о старте.",
+        reply_markup=main_keyboard(),
+    )
+
+    async def delayed_start():
+        await asyncio.sleep(minutes * 60)
+        await update.message.reply_text(
+            "Запускаю запланированную массовую отправку...",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await bulk_change_payment(update, context, threads, total_requests)
+
+    context.application.create_task(delayed_start())
+    context.user_data.pop("pending_bulk", None)
     return MENU
 
 
@@ -3014,6 +3115,14 @@ def main():
             ],
             ASK_TRIP_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, trip_text_input_handler)
+            ],
+            ASK_SCHEDULE_DELAY: [
+                CallbackQueryHandler(
+                    bulk_schedule_choice_callback, pattern="^bulkstart:"
+                ),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, bulk_schedule_delay_input
+                ),
             ],
         },
         fallbacks=[
