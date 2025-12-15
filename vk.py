@@ -1,20 +1,11 @@
 import json
 import logging
-from typing import Dict
 
 import vk_api
 from vk_api.longpoll import VkEventType, VkLongPoll
 
 import cfg
-from main import (
-    get_request_count_for_user,
-    get_user_token,
-    init_db,
-    is_user_verified,
-    random_token,
-    upsert_user_token,
-    verify_user_by_token,
-)
+from main import get_request_count_for_user, init_db
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +18,6 @@ class VkBot:
         self.vk_session = vk_api.VkApi(token=token)
         self.longpoll = VkLongPoll(self.vk_session)
         self.vk = self.vk_session.get_api()
-        self.pending_tokens: Dict[int, bool] = {}
 
     def send(self, user_id: int, text: str, keyboard: dict | None = None):
         payload = {
@@ -69,52 +59,16 @@ class VkBot:
 
     def handle_profile(self, user_id: int):
         total_requests = get_request_count_for_user(user_id)
-        existing_token = get_user_token(user_id)
-        token = existing_token or upsert_user_token(user_id, random_token(), True)
-
         text = (
             "👤 Профиль\n\n"
             f"VK ID: {user_id}\n"
             f"Всего отправлено запросов: {total_requests}\n"
-            f"Токен: {token}\n\n"
-            "Сохрани токен — его нужно вводить при первом запуске."
         )
-        keyboard = {
-            "one_time": False,
-            "buttons": [
-                [
-                    {
-                        "action": {"type": "text", "label": "Токен"},
-                        "color": "positive",
-                    }
-                ]
-            ],
-        }
-        self.send(user_id, text, keyboard)
-
-    def process_token(self, user_id: int, text: str) -> bool:
-        if verify_user_by_token(user_id, text.strip()):
-            self.pending_tokens.pop(user_id, None)
-            self.send(user_id, "Токен принят! Добро пожаловать.", self.start_keyboard())
-            return True
-        self.send(user_id, "Токен не найден. Попробуй снова.")
-        self.pending_tokens[user_id] = True
-        return False
+        self.send(user_id, text, self.start_keyboard())
 
     def handle_event(self, event):
         user_id = event.user_id
         text = (event.text or "").strip()
-
-        if user_id in self.pending_tokens or not is_user_verified(user_id):
-            self.pending_tokens[user_id] = True
-            if text:
-                self.process_token(user_id, text)
-            else:
-                self.send(
-                    user_id,
-                    "Отправь токен (10 символов из цифр и букв), чтобы продолжить.",
-                )
-            return
 
         lowered = text.lower()
         if lowered in {"/start", "start", "начать"}:
@@ -129,21 +83,10 @@ class VkBot:
             self.handle_profile(user_id)
             return
 
-        if text == "Токен":
-            new_token = random_token()
-            upsert_user_token(user_id, new_token, True)
-            self.send(
-                user_id,
-                f"Сгенерировал новый токен: {new_token}\n"
-                "Сохрани его для последующих запусков.",
-                self.start_keyboard(),
-            )
-            return
-
         self.send(
             user_id,
             "Пока что весь функционал доступен в Телеграм-боте. "
-            "Здесь доступны профайл и работа с токеном.",
+            "Здесь доступны профайл и ленты поездок.",
             self.start_keyboard(),
         )
 

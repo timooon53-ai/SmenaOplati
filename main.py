@@ -61,7 +61,8 @@ PROXY_FILE: Final = "proxy.txt"
     ASK_STREAM_TOTAL,
     ASK_TRIP_TEXT,
     ASK_ACCESS_TOKEN,
-) = range(18)
+    ASK_SCHEDULE_DELAY,
+) = range(19)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -77,32 +78,11 @@ _proxy_lock = threading.Lock()
 
 
 def is_user_allowed(user) -> bool:
-    if user is None:
-        return False
-
-    tg_id = user.id
-
-    if ADMIN_TG_ID is not None and tg_id == ADMIN_TG_ID:
-        return True
-
-    return is_user_verified(tg_id)
+    return True
 
 
 async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if is_user_allowed(update.effective_user):
-        return True
-
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "Привет! Чтобы продолжить, отправь, пожалуйста, свой токен "
-                "(10 символов, цифры и буквы)."
-            ),
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    return False
+    return True
 
 
 def require_access(handler):
@@ -792,7 +772,10 @@ async def fetch_session_details(session_id: str) -> dict:
             launch_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "launch", "response": _pretty_json_or_text(launch_text)}
+        {
+            "step": "launch",
+            "response": f"ID профиля: {result.get('trip_id', '—')}",
+        }
     )
 
     user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
@@ -817,7 +800,10 @@ async def fetch_session_details(session_id: str) -> dict:
             payment_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "paymentmethods", "response": _pretty_json_or_text(payment_text)}
+        {
+            "step": "paymentmethods",
+            "response": f"Карта: {result.get('card', '—')}",
+        }
     )
 
     card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
@@ -858,7 +844,10 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
             launch_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "launch", "response": _pretty_json_or_text(launch_text)}
+        {
+            "step": "launch",
+            "response": f"ID профиля: {result.get('trip_id', '—')}",
+        }
     )
 
     user_id_match = re.search(r"\"id\":\"([^\"]+)\"", launch_text)
@@ -882,7 +871,10 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
             payment_text = await resp.text()
 
     result["_debug_responses"].append(
-        {"step": "paymentmethods", "response": _pretty_json_or_text(payment_text)}
+        {
+            "step": "paymentmethods",
+            "response": f"Карта: {result.get('card', '—')}",
+        }
     )
 
     card_match = re.search(r"\"id\":\"(card[^\"]*)\"", payment_text)
@@ -1664,6 +1656,15 @@ def stream_start_markup() -> InlineKeyboardMarkup:
     )
 
 
+def schedule_keyboard(mode: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Отправить сейчас", callback_data=f"schedule:{mode}:now")],
+            [InlineKeyboardButton("Отправить через...", callback_data=f"schedule:{mode}:later")],
+        ]
+    )
+
+
 async def send_trip_templates_list(
     chat, tg_id: int, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -2392,7 +2393,6 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_requests = get_request_count_for_user(tg_id)
     last_session_id = context.user_data.get("last_session_id")
     proxy_state = proxy_state_text()
-    user_token = get_user_token(tg_id)
 
     msg = (
         f"👤 Профиль\n\n"
@@ -2401,42 +2401,13 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Прокси: {proxy_state}\n"
     )
 
-    if user_token:
-        msg += f"Твой токен: <code>{html.escape(user_token)}</code>\n"
-
     if last_session_id:
         msg += f"\nПоследний ID сессии: <code>{html.escape(str(last_session_id))}</code>\n"
 
     msg += "\nКнопка «Логи последней сессии» сразу скинет .txt по последней сессии."
 
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Токен", callback_data="token:generate")]]
-    )
-
     await update.message.reply_text(
         msg,
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
-    return MENU
-
-
-@require_access
-async def generate_token_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    tg_id = update.effective_user.id if update.effective_user else None
-    if tg_id is None:
-        await query.message.reply_text("Не смог получить TG ID для генерации токена.")
-        return MENU
-
-    token = random_token()
-    upsert_user_token(tg_id, token, True)
-
-    await query.message.reply_text(
-        f"Сгенерировал токен: <code>{html.escape(token)}</code>\n"
-        "Сохрани его — он понадобится при первом входе.",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -2980,9 +2951,6 @@ def main():
                 CallbackQueryHandler(trip_new_callback, pattern="^tripnew:"),
                 CallbackQueryHandler(trip_edit_callback, pattern="^tripedit:"),
                 CallbackQueryHandler(trip_delete_callback, pattern="^tripdelete:"),
-                CallbackQueryHandler(
-                    generate_token_callback, pattern="^token:generate$"
-                ),
                 CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
                 CallbackQueryHandler(start_choice_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
