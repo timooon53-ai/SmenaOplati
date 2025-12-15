@@ -38,7 +38,7 @@ ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
 ALLOWED_USER_IDS: Final = {7515876699, 966094117, 7846689040, 8143695937}
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
-DB_PATH: Final = "bot.db"
+DB_PATH: Final = os.getenv("BOT_DB_PATH", "bot.db")
 MIKE_DB_PATH: Final = r"C:\\Users\\Administrator\\PycharmProjects\\UpdatePriemZakazov\\db\\DB.bd"
 PROXY_FILE: Final = "proxy.txt"
 
@@ -93,6 +93,16 @@ def require_access(handler):
         return await handler(update, context, *args, **kwargs)
 
     return wrapper
+
+
+async def delete_callback_message(query):
+    message = getattr(query, "message", None)
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class ChangePaymentClient:
@@ -1492,6 +1502,7 @@ async def show_trip_loader(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def trip_load_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     parts = query.data.split(":", 1)
     choice = parts[1] if len(parts) > 1 else ""
 
@@ -1579,6 +1590,7 @@ async def trip_text_input_handler(update: Update, context: ContextTypes.DEFAULT_
 async def tripfield_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str, field = query.data.split(":", 2)
         trip_id = int(trip_id_str)
@@ -1737,6 +1749,7 @@ async def send_trip_manager_list(chat, tg_id: int, context: ContextTypes.DEFAULT
 async def trip_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     parts = query.data.split(":", 1)
     origin = parts[1] if len(parts) > 1 else "list"
@@ -1767,6 +1780,7 @@ async def trip_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     choice = query.data.split(":", 1)[1]
 
     if choice == "create":
@@ -1797,6 +1811,7 @@ async def streams_option_callback(update: Update, context: ContextTypes.DEFAULT_
 async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1846,6 +1861,7 @@ async def trip_select_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
     except Exception:  # noqa: BLE001
@@ -1904,6 +1920,7 @@ async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def trip_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1934,6 +1951,7 @@ async def trip_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def trip_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1967,6 +1985,7 @@ async def trip_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def trip_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -1998,6 +2017,7 @@ async def trip_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def trip_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -2022,6 +2042,7 @@ async def trip_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def trip_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     try:
         _, trip_id_str = query.data.split(":", 1)
         trip_id = int(trip_id_str)
@@ -2229,6 +2250,7 @@ async def access_token_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
     choice = query.data
 
     if choice == "single":
@@ -2453,6 +2475,7 @@ async def send_mike_orders_list(chat, tg_id: int):
 async def mike_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     await send_mike_orders_list(query.message, update.effective_user.id)
     return MENU
@@ -2462,6 +2485,7 @@ async def mike_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def mike_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     try:
         _, _, row_id_str = query.data.split(":", 2)
@@ -2510,6 +2534,7 @@ async def mike_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def mike_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await delete_callback_message(query)
 
     try:
         _, _, row_id_str = query.data.split(":", 2)
