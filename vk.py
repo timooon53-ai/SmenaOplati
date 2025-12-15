@@ -8,8 +8,7 @@ import vk_api
 from vk_api.longpoll import VkEventType, VkLongPoll
 
 os.environ.setdefault("BOT_DB_PATH", "VD.db")
-
-import cfg
+from cfg import VK_TOKEN
 from main import (
     build_headers,
     build_payload,
@@ -26,7 +25,7 @@ from main import (
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-VK_TOKEN = getattr(cfg, "VK_TOKEN", None)
+VK_TOKEN = VK_TOKEN
 
 
 class VkBot:
