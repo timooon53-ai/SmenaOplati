@@ -15,10 +15,16 @@ from main import (
     do_single_request_and_log,
     generate_session_id,
     get_request_count_for_user,
+    list_trip_templates,
     init_db,
+    import_mike_order_to_trip,
     load_proxies,
     proxy_state_text,
     proxies_enabled,
+    create_trip_template,
+    update_trip_template_field,
+    delete_trip_template,
+    fetch_mike_orders,
     session_service,
 )
 
@@ -99,6 +105,34 @@ class VkBot:
             ],
         }
 
+    def trips_keyboard(self) -> dict:
+        return {
+            "one_time": False,
+            "inline": False,
+            "buttons": [
+                [
+                    {
+                        "action": {"type": "text", "label": "➕ Добавить поездку"},
+                        "color": "primary",
+                    },
+                    {
+                        "action": {"type": "text", "label": "📋 Мои поездки"},
+                        "color": "secondary",
+                    },
+                ],
+                [
+                    {
+                        "action": {"type": "text", "label": "📥 Из Майка"},
+                        "color": "primary",
+                    },
+                    {
+                        "action": {"type": "text", "label": "🔙 Назад"},
+                        "color": "secondary",
+                    },
+                ],
+            ],
+        }
+
     def schedule_keyboard(self) -> dict:
         return {
             "one_time": False,
@@ -131,20 +165,43 @@ class VkBot:
 
     def handle_change_payment_mode(self, user_id: int, text: str) -> bool:
         lowered = text.lower()
+        current_data = self.state.get(user_id, {}).get("data", {})
         if lowered in {"🎯 одиночная смена", "одиночная смена"}:
-            self.update_state(user_id, flow="single", step="token", data={})
-            self.send(
-                user_id,
-                "Пришли token2 или session_id. Если укажешь session_id — token2 очищу.",
-            )
+            self.update_state(user_id, flow="single", step="token", data=current_data)
+            if current_data.get("token") or current_data.get("session_cookie"):
+                if not current_data.get("orderid"):
+                    self._ask_next_field(user_id, "orderid")
+                elif not current_data.get("card"):
+                    self._ask_next_field(user_id, "card")
+                elif not current_data.get("id"):
+                    self._ask_next_field(user_id, "id")
+                else:
+                    self._ask_schedule(user_id)
+            else:
+                self.send(
+                    user_id,
+                    "Пришли token2 или session_id. Если укажешь session_id — token2 очищу.",
+                )
             return True
 
         if lowered in {"🚀 запустить потоки", "запустить потоки"}:
-            self.update_state(user_id, flow="bulk", step="token", data={})
-            self.send(
-                user_id,
-                "Пришли token2 или session_id для потоков. Если дадим session_id — token2 не понадобится.",
-            )
+            self.update_state(user_id, flow="bulk", step="token", data=current_data)
+            if current_data.get("token") or current_data.get("session_cookie"):
+                if not current_data.get("orderid"):
+                    self._ask_next_field(user_id, "orderid")
+                elif not current_data.get("card"):
+                    self._ask_next_field(user_id, "card")
+                elif not current_data.get("id"):
+                    self._ask_next_field(user_id, "id")
+                elif not current_data.get("threads"):
+                    self._ask_next_field(user_id, "threads")
+                else:
+                    self._ask_next_field(user_id, "total")
+            else:
+                self.send(
+                    user_id,
+                    "Пришли token2 или session_id для потоков. Если дадим session_id — token2 не понадобится.",
+                )
             return True
         return False
 
@@ -205,6 +262,76 @@ class VkBot:
             self.mode_keyboard(),
         )
 
+    def _format_trip(self, idx: int, trip: dict) -> str:
+        name = trip.get("trip_name") or f"Поездка #{trip.get('id')}"
+        notes = []
+        if trip.get("token2"):
+            notes.append("token2")
+        if trip.get("session_id"):
+            notes.append("session_id")
+        if trip.get("trip_id"):
+            notes.append(f"ID: {trip['trip_id']}")
+        if trip.get("orderid"):
+            notes.append(f"orderid: {trip['orderid']}")
+        if trip.get("card"):
+            notes.append(f"card-x: {trip['card']}")
+        if trip.get("trip_link"):
+            notes.append("ссылка есть")
+        note_text = ", ".join(notes) if notes else "пусто"
+        return f"{idx}. {name} (id={trip.get('id')}): {note_text}"
+
+    def _send_trips_list(self, user_id: int):
+        trips = list_trip_templates(user_id)
+        if not trips:
+            self.send(user_id, "У тебя пока нет поездок. Добавь новую.", self.trips_keyboard())
+            return
+        lines = ["📋 Твои поездки:"]
+        for idx, trip in enumerate(trips, start=1):
+            lines.append(self._format_trip(idx, trip))
+        lines.append("\nНапиши номер, чтобы использовать её. Напиши 'удалить N' чтобы удалить.")
+        self.update_state(user_id, step="trip_list", trips=trips)
+        self.send(user_id, "\n".join(lines), self.trips_keyboard())
+
+    def _prepare_trip_creation(self, user_id: int):
+        trip_id = create_trip_template(user_id)
+        self.update_state(user_id, step="trip_name", active_trip=trip_id)
+        self.send(user_id, "Введи название поездки (можно пропустить, отправив '-').")
+
+    def _fill_trip_field(self, user_id: int, field: str, value: str):
+        trip_id = self.state.get(user_id, {}).get("active_trip")
+        if not trip_id:
+            self.send(user_id, "Не нашёл активную поездку, начни заново.", self.trips_keyboard())
+            return False
+        if value and value != "-":
+            update_trip_template_field(trip_id, user_id, field, value)
+        return True
+
+    def _use_trip(self, user_id: int, trip: dict):
+        token = trip.get("token2")
+        session_cookie = trip.get("session_id")
+        if not token and not session_cookie:
+            self.send(user_id, "В этой поездке нет token2/session_id. Заполни и попробуй снова.", self.trips_keyboard())
+            return
+        data = {}
+        if session_cookie:
+            data["session_cookie"] = session_cookie
+        elif token:
+            data["token"] = token
+        if trip.get("orderid"):
+            data["orderid"] = trip.get("orderid")
+        if trip.get("card"):
+            data["card"] = trip.get("card")
+        if trip.get("trip_id"):
+            data["id"] = trip.get("trip_id")
+
+        self.reset_state(user_id)
+        self.update_state(user_id, data=data, step="choose_mode", flow=None)
+        self.send(
+            user_id,
+            "Данные поездки перенесены. Выбирай режим: одиночная смена или потоки.",
+            self.mode_keyboard(),
+        )
+
     def _ask_next_field(self, user_id: int, step: str):
         prompts = {
             "orderid": "Теперь введи orderid:",
@@ -229,9 +356,96 @@ class VkBot:
         state = self.state.get(user_id) or {}
         step = state.get("step")
         data = state.get("data", {})
+        trips = state.get("trips", [])
 
         if step == "choose_mode":
             return self.handle_change_payment_mode(user_id, text)
+
+        if step == "trip_menu":
+            lowered = text.lower()
+            if lowered in {"➕ добавить поездку", "добавить поездку"}:
+                self._prepare_trip_creation(user_id)
+                return True
+            if lowered in {"📋 мои поездки", "мои поездки"}:
+                self._send_trips_list(user_id)
+                return True
+            if lowered in {"📥 из майка", "из майка"}:
+                orders = fetch_mike_orders()
+                if not orders:
+                    self.send(user_id, "Не нашёл заказов в базе Майка.", self.trips_keyboard())
+                    return True
+                for order in orders[:10]:
+                    import_mike_order_to_trip(order, user_id)
+                self.send(user_id, "Импортировал последние заказы. Теперь выбери поездку.", self.trips_keyboard())
+                self._send_trips_list(user_id)
+                return True
+            if lowered == "🔙 назад":
+                self.reset_state(user_id)
+                self.send(user_id, "Возврат в главное меню.", self.start_keyboard())
+                return True
+            return False
+
+        if step == "trip_name":
+            self._fill_trip_field(user_id, "trip_name", text)
+            self.update_state(user_id, step="trip_token")
+            self.send(user_id, "Введи token2 или session_id (если session_id, token2 очищу).")
+            return True
+
+        if step == "trip_token":
+            if "session" in text.lower():
+                self._fill_trip_field(user_id, "session_id", text)
+                update_trip_template_field(state.get("active_trip"), user_id, "token2", None)
+            else:
+                self._fill_trip_field(user_id, "token2", text)
+            self.update_state(user_id, step="trip_id")
+            self.send(user_id, "Введи ID поездки (можно пропустить '-')")
+            return True
+
+        if step == "trip_id":
+            self._fill_trip_field(user_id, "trip_id", text)
+            self.update_state(user_id, step="trip_card")
+            self.send(user_id, "Теперь card-x (или '-' чтобы пропустить)")
+            return True
+
+        if step == "trip_card":
+            self._fill_trip_field(user_id, "card", text)
+            self.update_state(user_id, step="trip_orderid")
+            self.send(user_id, "Теперь orderid (или '-' чтобы пропустить)")
+            return True
+
+        if step == "trip_orderid":
+            self._fill_trip_field(user_id, "orderid", text)
+            self.update_state(user_id, step="trip_link")
+            self.send(user_id, "Ссылка на поездку (или '-' чтобы пропустить)")
+            return True
+
+        if step == "trip_link":
+            self._fill_trip_field(user_id, "trip_link", text)
+            self.send(user_id, "Готово! Поездка сохранена.", self.trips_keyboard())
+            self.reset_state(user_id)
+            return True
+
+        if step == "trip_list":
+            lowered = text.lower()
+            if lowered.startswith("удалить"):
+                try:
+                    idx = int(lowered.replace("удалить", "").strip())
+                    trip = trips[idx - 1]
+                except Exception:  # noqa: BLE001
+                    self.send(user_id, "Не понял номер для удаления.", self.trips_keyboard())
+                    return True
+                delete_trip_template(trip.get("id"), user_id)
+                self.send(user_id, "Удалил поездку.", self.trips_keyboard())
+                self._send_trips_list(user_id)
+                return True
+            try:
+                idx = int(text)
+                trip = trips[idx - 1]
+            except Exception:  # noqa: BLE001
+                self.send(user_id, "Напиши номер поездки или 'удалить N'.", self.trips_keyboard())
+                return True
+            self._use_trip(user_id, trip)
+            return True
 
         if step == "token":
             if text:
@@ -412,11 +626,12 @@ class VkBot:
             return
 
         if text == "🚂 Загрузить поездки":
+            self.reset_state(user_id)
+            self.update_state(user_id, step="trip_menu", data={}, trips=[])
             self.send(
                 user_id,
-                "Менеджер поездок пока доступен только в Телеграм-боте. "
-                "Смена оплаты и логирование работают здесь полностью.",
-                self.start_keyboard(),
+                "Управление поездками: добавляй, используй и удаляй шаблоны.",
+                self.trips_keyboard(),
             )
             return
 
