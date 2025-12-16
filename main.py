@@ -95,6 +95,24 @@ def require_access(handler):
     return wrapper
 
 
+async def safe_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    **kwargs,
+):
+    message = update.effective_message
+    if message:
+        return await message.reply_text(text, **kwargs)
+
+    chat = update.effective_chat
+    if chat:
+        return await context.bot.send_message(chat_id=chat.id, text=text, **kwargs)
+
+    logger.warning("Не удалось найти сообщение/чат для ответа: %s", text)
+    return None
+
+
 async def delete_callback_message(query):
     message = getattr(query, "message", None)
     if message is None:
@@ -574,6 +592,36 @@ def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str)
 
     conn.commit()
     conn.close()
+
+
+def find_trip_template_by_token2(tg_id: int, token2: str) -> Optional[int]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM trip_templates WHERE tg_id = ? AND token2 = ? LIMIT 1;",
+        (tg_id, token2),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def ensure_trip_from_token2(
+    tg_id: int, token2: str, trip_id: Optional[str], card: Optional[str]
+) -> int:
+    trip_db_id = find_trip_template_by_token2(tg_id, token2)
+    if trip_db_id is None:
+        trip_db_id = create_trip_template(tg_id)
+
+    update_trip_template_field(trip_db_id, tg_id, "trip_name", token2)
+    update_trip_template_field(trip_db_id, tg_id, "token2", token2)
+
+    if trip_id:
+        update_trip_template_field(trip_db_id, tg_id, "trip_id", trip_id)
+    if card:
+        update_trip_template_field(trip_db_id, tg_id, "card", card)
+
+    return trip_db_id
 
 
 def list_trip_templates(tg_id: int) -> List[dict]:
@@ -1256,8 +1304,8 @@ async def do_single_request_and_log(
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["💳 Поменять оплату", "👤 Профиль"],
-            ["🚂 Загрузить поездки", "📜 Логи"],
+            ["🎄💳 Поменять оплату", "🎄👤 Профиль"],
+            ["🎄🚂 Загрузить поездки", "🎄📜 Логи"],
         ],
         resize_keyboard=True,
     )
@@ -1266,10 +1314,10 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 def actions_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["🎯 Одиночная смена"],
-            ["🚀 Запустить потоки"],
-            ["🛑 Остановить потоки"],
-            ["🔙 Назад"],
+            ["🎄🎯 Одиночная смена"],
+            ["🎄🚀 Запустить потоки"],
+            ["🎄🛑 Остановить потоки"],
+            ["🎄🔙 Назад"],
         ],
         resize_keyboard=True,
     )
@@ -1360,9 +1408,9 @@ async def restart_bot(context: ContextTypes.DEFAULT_TYPE):
 def logs_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["📖 Посмотреть логи"],
-            ["🕒 Логи последней сессии"],
-            ["🔙 Назад"],
+            ["🎄📖 Посмотреть логи"],
+            ["🎄🕒 Логи последней сессии"],
+            ["🎄🔙 Назад"],
         ],
         resize_keyboard=True,
     )
@@ -1628,7 +1676,7 @@ async def trip_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if tg_id is None or not isinstance(pending, dict):
         await update.message.reply_text(
-            "Не нашёл активный слот для сохранения. Нажми «🚂 Загрузить поездки» снова.",
+            "Не нашёл активный слот для сохранения. Нажми «🎄🚂 Загрузить поездки» снова.",
             reply_markup=main_keyboard(),
         )
         return MENU
@@ -1723,20 +1771,20 @@ async def send_trip_manager_list(chat, tg_id: int, context: ContextTypes.DEFAULT
     keyboard = [
         [
             InlineKeyboardButton(
-                f"🧳 #{t['id']} | {t.get('trip_name') or t.get('orderid') or 'без названия'}",
+                f"🎄🧳 #{t['id']} | {t.get('trip_name') or t.get('orderid') or 'без названия'}",
                 callback_data=f"tripmanage:{t['id']}",
             )
         ]
         for t in templates
     ]
     keyboard.append(
-        [InlineKeyboardButton("➕ Добавить поездку", callback_data="tripnew:manage")]
+        [InlineKeyboardButton("🎄➕ Добавить поездку", callback_data="tripnew:manage")]
     )
 
     if templates:
-        text = "🚂 Выбери поездку для редактирования или удаления, либо добавь новую ⤵️:"
+        text = "🎄🚂 Выбери поездку для редактирования или удаления, либо добавь новую ⤵️:"
     else:
-        text = "🚧 Пока нет сохранённых поездок. Нажми «➕ Добавить поездку», чтобы начать."
+        text = "🎄🚧 Пока нет сохранённых поездок. Нажми «🎄➕ Добавить поездку», чтобы начать."
 
     await chat.reply_text(
         text,
@@ -2091,8 +2139,37 @@ async def stream_token_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     token = update.message.text.strip()
     context.user_data.setdefault("stream_config", {})["token"] = token
     context.user_data.setdefault("stream_config", {}).pop("session_cookie", None)
+    notes: List[str] = []
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+
+    if tg_id:
+        try:
+            parsed = await fetch_trip_details_from_token(token)
+            trip_db_id = ensure_trip_from_token2(
+                tg_id, token, parsed.get("trip_id"), parsed.get("card")
+            )
+
+            details_parts = []
+            if parsed.get("trip_id"):
+                details_parts.append(f"ID: {parsed['trip_id']}")
+            if parsed.get("card"):
+                details_parts.append(f"card-x: {parsed['card']}")
+
+            parsed_text = f" ({', '.join(details_parts)})" if details_parts else ""
+            notes.append(
+                f"🎄 Сохранил аккаунт в базу как поездку «{token}»{parsed_text}. ID записи: {trip_db_id}."
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Не удалось сохранить аккаунт по token2: %s", e)
+            notes.append("🎄 Не смог автоматически сохранить аккаунт в базу.")
+
+    reply_lines = ["🎄 Принял token2. Теперь введи orderid:"]
+    reply_lines.extend(notes)
+
     await update.message.reply_text(
-        "Принял token2. Теперь введи orderid:", reply_markup=ReplyKeyboardRemove()
+        "\n".join(reply_lines), reply_markup=ReplyKeyboardRemove()
     )
     return ASK_STREAM_ORDERID
 
@@ -2203,11 +2280,11 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_access
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! 👋\n"
-        "Я бот для отправки запроса changepayment.\n\n"
-        "Нажми «💳 Поменять оплату», там выбери «🎯 Одиночная смена» или «🚀 Запустить потоки».\n"
-        "Кнопка «🚂 Загрузить поездки» — чтобы добавить или обновить поездки.\n\n"
-        f"Прокси: {proxy_state_text()}",
+        "🎄 Привет! 👋\n"
+        "🎄 Я бот для отправки запроса changepayment.\n\n"
+        "🎄 Нажми «🎄💳 Поменять оплату», там выбери «🎄🎯 Одиночная смена» или «🎄🚀 Запустить потоки».\n"
+        "🎄 Кнопка «🎄🚂 Загрузить поездки» — чтобы добавить или обновить поездки.\n\n"
+        f"🎄 Прокси: {proxy_state_text()}",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -2263,8 +2340,8 @@ async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if choice == "bulk":
         await query.message.reply_text(
-            "Выбрал массовый запуск. Сначала введи параметры через «💳 Поменять оплату»,"
-            " а потом нажми «🚀 Запустить потоки».",
+            "Выбрал массовый запуск. Сначала введи параметры через «🎄💳 Поменять оплату»,"
+            " а потом нажми «🎄🚀 Запустить потоки».",
             reply_markup=main_keyboard(),
         )
         return MENU
@@ -2315,11 +2392,11 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Все параметры сохранены ✅\n\n"
         "Теперь ты можешь:\n"
-        "• Через «💳 Поменять оплату» → «🎯 Одиночная смена» — один POST-запрос.\n"
-        "• Через «💳 Поменять оплату» → «🚀 Запустить потоки» — массовая отправка.\n"
-        "• «👤 Профиль» — статистика.\n"
-        "• «📜 Логи» — меню для выгрузки логов.\n"
-        "• «🚂 Загрузить поездки» — добавление и редактирование поездок.",
+        "• Через «🎄💳 Поменять оплату» → «🎄🎯 Одиночная смена» — один POST-запрос.\n"
+        "• Через «🎄💳 Поменять оплату» → «🎄🚀 Запустить потоки» — массовая отправка.\n"
+        "• «🎄👤 Профиль» — статистика.\n"
+        "• «🎄📜 Логи» — меню для выгрузки логов.\n"
+        "• «🎄🚂 Загрузить поездки» — добавление и редактирование поездок.",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -2329,13 +2406,13 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    if text == "💳 Поменять оплату":
+    if text == "🎄💳 Поменять оплату":
         await update.message.reply_text(
             "Выбери действие ⤵️:", reply_markup=actions_keyboard()
         )
         return MENU
 
-    if text == "🎯 Одиночная смена":
+    if text == "🎄🎯 Одиночная смена":
         proxy_state = proxy_state_text()
         await update.message.reply_text(
             "Окей, погнали. 🚀\n"
@@ -2345,13 +2422,13 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_TOKEN
 
-    if text == "🚀 Запустить потоки":
+    if text == "🎄🚀 Запустить потоки":
         await update.message.reply_text(
             "Выбери, как запускать потоки ⚙️:", reply_markup=stream_start_markup()
         )
         return MENU
 
-    if text == "🛑 Остановить потоки":
+    if text == "🎄🛑 Остановить потоки":
         stopped, completed, success, failed, session_id = await stop_streams_with_logging(
             update, context, reason="кнопка"
         )
@@ -2369,28 +2446,28 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return MENU
 
-    if text == "🔙 Назад":
+    if text == "🎄🔙 Назад":
         await update.message.reply_text("Возвращаюсь в меню ↩️.", reply_markup=main_keyboard())
         return MENU
 
-    if text == "👤 Профиль":
+    if text == "🎄👤 Профиль":
         return await show_profile(update, context)
 
-    if text == "📜 Логи":
+    if text == "🎄📜 Логи":
         await update.message.reply_text("Что показать? 📂", reply_markup=logs_keyboard())
         return MENU
 
-    if text == "📖 Посмотреть логи":
+    if text == "🎄📖 Посмотреть логи":
         await update.message.reply_text(
             "Введи ID сессии (5–7 цифр), лог которой хочешь получить:",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ASK_LOG_SESSION_ID
 
-    if text == "🕒 Логи последней сессии":
+    if text == "🎄🕒 Логи последней сессии":
         return await last_session_logs(update, context)
 
-    if text == "🚂 Загрузить поездки":
+    if text == "🎄🚂 Загрузить поездки":
         return await show_trip_loader(update, context)
 
     await update.message.reply_text(
@@ -2417,7 +2494,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     proxy_state = proxy_state_text()
 
     msg = (
-        f"👤 Профиль\n\n"
+        f"🎄👤 Профиль\n\n"
         f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
         f"Всего отправлено запросов: <b>{total_requests}</b>\n"
         f"Прокси: {proxy_state}\n"
@@ -2426,7 +2503,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last_session_id:
         msg += f"\nПоследний ID сессии: <code>{html.escape(str(last_session_id))}</code>\n"
 
-    msg += "\nКнопка «Логи последней сессии» сразу скинет .txt по последней сессии."
+    msg += "\nКнопка «🎄🕒 Логи последней сессии» сразу скинет .txt по последней сессии."
 
     await update.message.reply_text(
         msg,
@@ -2834,7 +2911,7 @@ async def change_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not ((user_token or session_cookie) and orderid and card and _id):
         await update.message.reply_text(
-            "Похоже, какие-то параметры не заданы. Нажми «💳 Поменять оплату» и введи данные заново.",
+            "🎄 Похоже, какие-то параметры не заданы. Нажми «🎄💳 Поменять оплату» и введи данные заново.",
             reply_markup=main_keyboard(),
         )
         return MENU
@@ -2909,8 +2986,10 @@ async def bulk_change_payment(
 
     active_stop: Optional[asyncio.Event] = context.user_data.get("stop_event")
     if isinstance(active_stop, asyncio.Event) and not active_stop.is_set():
-        await update.message.reply_text(
-            "У тебя уже идёт массовая отправка. Дождись окончания или нажми"
+        await safe_reply(
+            update,
+            context,
+            "🎄 У тебя уже идёт массовая отправка. Дождись окончания или нажми"
             " «Остановить потоки».",
             reply_markup=main_keyboard(),
         )
@@ -2924,8 +3003,10 @@ async def bulk_change_payment(
     _id = context.user_data.get("id")
 
     if not ((user_token or session_cookie) and orderid and card and _id):
-        await update.message.reply_text(
-            "Параметры не заданы полностью. Нажми «💳 Поменять оплату» и введи данные.",
+        await safe_reply(
+            update,
+            context,
+            "🎄 Параметры не заданы полностью. Нажми «🎄💳 Поменять оплату» и введи данные.",
             reply_markup=main_keyboard(),
         )
         return
@@ -2939,14 +3020,16 @@ async def bulk_change_payment(
     session_id = generate_session_id()
     context.user_data["last_session_id"] = session_id
 
-    await update.message.reply_text(
-        f"Запускаю массовую отправку.\n"
+    await safe_reply(
+        update,
+        context,
+        f"🎄 Запускаю массовую отправку.\n"
         f"ID сессии: <code>{session_id}</code>\n"
         f"Потоки (одновременных запросов): {threads}\n"
         f"Всего логических запросов: {total_requests}\n"
         f"Прокси: {proxy_state}\n\n"
         f"Каждые 5 секунд буду присылать лог (headers, body, последний ответ).\n"
-        f"Чтобы остановить — нажми «Остановить потоки».",
+        f"Чтобы остановить — нажми «🎄🛑 Остановить потоки».",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -3026,8 +3109,10 @@ async def bulk_change_payment(
 
     failed = completed - success
 
-    await update.message.reply_text(
-        f"Массовая отправка завершена (или остановлена).\n"
+    await safe_reply(
+        update,
+        context,
+        f"🎄 Массовая отправка завершена (или остановлена).\n"
         f"ID сессии: <code>{session_id}</code>\n"
         f"Прокси: {proxy_state}\n"
         f"Успешных логических запросов: {success}\n"
