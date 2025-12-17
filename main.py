@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import html
+from pathlib import Path
 from functools import wraps
 from typing import Final, Optional, Tuple, List, Callable, Awaitable
 
@@ -38,9 +39,10 @@ ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
 ALLOWED_USER_IDS: Final = {7515876699, 966094117, 7846689040, 8143695937}
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
-DB_PATH: Final = os.getenv("BOT_DB_PATH", "bot.db")
-MIKE_DB_PATH: Final = r"C:\\Users\\Administrator\\PycharmProjects\\UpdatePriemZakazov\\db\\DB.bd"
-PROXY_FILE: Final = "proxy.txt"
+BASE_DIR: Final = Path(__file__).resolve().parent
+DB_PATH: Final = Path(os.getenv("BOT_DB_PATH") or (BASE_DIR / "bot.db"))
+MIKE_DB_PATH: Final = Path(os.getenv("MIKE_DB_PATH") or (BASE_DIR / "db" / "DB.bd"))
+PROXY_FILE: Final = Path(os.getenv("PROXY_FILE_PATH") or (BASE_DIR / "proxy.txt"))
 
 (
     ASK_TOKEN,
