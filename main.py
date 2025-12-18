@@ -26,6 +26,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.ext import ExtBot
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -125,6 +126,7 @@ async def send_with_retry(
     retries: int = 3,
     base_delay: float = 1.0,
     max_delay: float = 10.0,
+    raise_on_failure: bool = False,
 ):
     delay = base_delay
     last_exc: Optional[BaseException] = None
@@ -135,7 +137,7 @@ async def send_with_retry(
         except RetryAfter as exc:
             last_exc = exc
             await asyncio.sleep(exc.retry_after)
-        except (TimedOut, NetworkError) as exc:
+        except (TimedOut, NetworkError, asyncio.TimeoutError, aiohttp.ClientError) as exc:
             last_exc = exc
             logger.warning(
                 "Ошибка связи с Telegram (%s). Попытка %d/%d.",
@@ -154,7 +156,17 @@ async def send_with_retry(
                 delay = min(delay * 2, max_delay)
 
     logger.error("Исчерпаны попытки отправки сообщения: %s", last_exc)
+    if raise_on_failure and last_exc:
+        raise last_exc
     return None
+
+
+class ResilientExtBot(ExtBot):
+    async def _do_post(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        async def _call():
+            return await super()._do_post(*args, **kwargs)
+
+        return await send_with_retry(_call, raise_on_failure=True, retries=5, base_delay=1.0)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -3194,7 +3206,7 @@ def build_application() -> "Application":
     init_db()
     load_proxies()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).bot(ResilientExtBot).build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("request", request_restart))
 
