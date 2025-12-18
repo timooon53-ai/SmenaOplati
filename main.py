@@ -164,7 +164,9 @@ async def send_with_retry(
 class ResilientExtBot(ExtBot):
     async def _do_post(self, *args, **kwargs):  # noqa: ANN002, ANN003
         async def _call():
-            return await super()._do_post(*args, **kwargs)
+            # Используем явный вызов супер-класса, чтобы избежать ошибок
+            # "super(): no arguments" внутри вложенной функции.
+            return await super(ResilientExtBot, self)._do_post(*args, **kwargs)
 
         return await send_with_retry(_call, raise_on_failure=True, retries=5, base_delay=1.0)
 
@@ -3297,6 +3299,9 @@ def run_bot_with_restart():
     while True:
         app = build_application()
         try:
+            # Явно создаём и устанавливаем новый цикл событий перед запуском,
+            # чтобы избежать "There is no current event loop in thread 'MainThread'".
+            asyncio.set_event_loop(asyncio.new_event_loop())
             app.run_polling()
         except KeyboardInterrupt:
             logger.info("Бот остановлен вручную.")
