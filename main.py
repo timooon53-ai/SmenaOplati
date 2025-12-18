@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import html
+import time
 from pathlib import Path
 from functools import wraps
 from typing import Final, Optional, Tuple, List, Callable, Awaitable
@@ -24,6 +25,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -105,14 +107,69 @@ async def safe_reply(
 ):
     message = update.effective_message
     if message:
-        return await message.reply_text(text, **kwargs)
+        return await send_with_retry(lambda: message.reply_text(text, **kwargs))
 
     chat = update.effective_chat
     if chat:
-        return await context.bot.send_message(chat_id=chat.id, text=text, **kwargs)
+        return await send_with_retry(
+            lambda: context.bot.send_message(chat_id=chat.id, text=text, **kwargs)
+        )
 
     logger.warning("Не удалось найти сообщение/чат для ответа: %s", text)
     return None
+
+
+async def send_with_retry(
+    send_func: Callable[[], Awaitable],
+    *,
+    retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 10.0,
+):
+    delay = base_delay
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return await send_func()
+        except RetryAfter as exc:
+            last_exc = exc
+            await asyncio.sleep(exc.retry_after)
+        except (TimedOut, NetworkError) as exc:
+            last_exc = exc
+            logger.warning(
+                "Ошибка связи с Telegram (%s). Попытка %d/%d.",
+                type(exc).__name__,
+                attempt,
+                retries,
+            )
+            if attempt < retries:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.exception("Не удалось отправить сообщение (попытка %d/%d)", attempt, retries)
+            if attempt < retries:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
+
+    logger.error("Исчерпаны попытки отправки сообщения: %s", last_exc)
+    return None
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Ошибка при обработке апдейта %s: %s", update, context.error)
+
+    try:
+        if isinstance(update, Update):
+            await safe_reply(
+                update,
+                context,
+                "Произошла временная ошибка. Попробуй повторить действие чуть позже.",
+                reply_markup=main_keyboard(),
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("Не удалось отправить уведомление об ошибке", exc_info=True)
 
 
 async def delete_callback_message(query):
@@ -2281,7 +2338,9 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_access
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await safe_reply(
+        update,
+        context,
         "🎄 Привет! 👋\n"
         "🎄 Я бот для отправки запроса changepayment.\n\n"
         "🎄 Нажми «🎄💳 Поменять оплату», там выбери «🎄🎯 Одиночная смена» или «🎄🚀 Запустить потоки».\n"
@@ -3131,14 +3190,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-
-
-def main():
+def build_application() -> "Application":
     init_db()
     load_proxies()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("request", request_restart))
 
     conv = ConversationHandler(
@@ -3220,9 +3277,32 @@ def main():
     )
 
     app.add_handler(conv)
+    return app
 
-    app.run_polling()
+
+def run_bot_with_restart():
+    while True:
+        app = build_application()
+        try:
+            app.run_polling()
+        except KeyboardInterrupt:
+            logger.info("Бот остановлен вручную.")
+            break
+        except Exception:
+            logger.exception(
+                "Бот упал с ошибкой. Перезапуск через 5 секунд...", exc_info=True
+            )
+            try:
+                asyncio.run(app.shutdown())
+            except Exception:
+                logger.debug(
+                    "Не удалось корректно завершить приложение после сбоя",
+                    exc_info=True,
+                )
+            time.sleep(5)
+        else:
+            break
 
 
 if __name__ == "__main__":
-    main()
+    run_bot_with_restart()
