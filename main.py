@@ -3206,7 +3206,8 @@ def build_application() -> "Application":
     init_db()
     load_proxies()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).bot(ResilientExtBot).build()
+    bot = ResilientExtBot(token=BOT_TOKEN)
+    app = ApplicationBuilder().bot(bot).build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("request", request_restart))
 
