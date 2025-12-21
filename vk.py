@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import asyncio
+from typing import Iterable
 
 import vk_api
 from vk_api.longpoll import VkEventType, VkLongPoll
@@ -26,6 +27,8 @@ from main import (
     delete_trip_template,
     fetch_mike_orders,
     session_service,
+    fetch_trip_details_from_token,
+    fetch_session_details,
 )
 
 logger = logging.getLogger(__name__)
@@ -352,6 +355,77 @@ class VkBot:
             self.schedule_keyboard(),
         )
 
+    def _autofill_from_token(self, token: str, data: dict) -> str | None:
+        try:
+            parsed = asyncio.run(fetch_trip_details_from_token(token))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось автоматически получить данные по token2: %s", exc)
+            return None
+
+        notes = []
+        if parsed.get("trip_id") and not data.get("id"):
+            data["id"] = parsed["trip_id"]
+            notes.append(f"ID: {parsed['trip_id']}")
+        if parsed.get("card") and not data.get("card"):
+            data["card"] = parsed["card"]
+            notes.append(f"card-x: {parsed['card']}")
+
+        if not notes:
+            return None
+        return "Нашёл в token2: " + ", ".join(notes)
+
+    def _autofill_from_session(self, session_id: str, data: dict) -> Iterable[str]:
+        try:
+            parsed = asyncio.run(fetch_session_details(session_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось автоматически получить данные по session_id: %s", exc)
+            return []
+
+        notes: list[str] = []
+        if parsed.get("trip_id") and not data.get("id"):
+            data["id"] = parsed["trip_id"]
+            notes.append(f"ID: {parsed['trip_id']}")
+        if parsed.get("card") and not data.get("card"):
+            data["card"] = parsed["card"]
+            notes.append(f"card-x: {parsed['card']}")
+        if parsed.get("orderid") and not data.get("orderid"):
+            data["orderid"] = parsed["orderid"]
+            notes.append(f"orderid: {parsed['orderid']}")
+        return notes
+
+    def _autofill_trip_template(self, trip_id: int, user_id: int, source: str, is_session: bool):
+        try:
+            parsed = (
+                asyncio.run(fetch_session_details(source))
+                if is_session
+                else asyncio.run(fetch_trip_details_from_token(source))
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось автозаполнить поездку (%s): %s", source, exc)
+            return None
+
+        updated_fields: list[str] = []
+
+        for field in ("trip_id", "card", "orderid"):
+            value = parsed.get(field)
+            if value:
+                update_trip_template_field(trip_id, user_id, field, value)
+                updated_fields.append(field)
+
+        if not updated_fields:
+            return None
+
+        details = []
+        if parsed.get("trip_id"):
+            details.append(f"ID: {parsed['trip_id']}")
+        if parsed.get("card"):
+            details.append(f"card-x: {parsed['card']}")
+        if parsed.get("orderid"):
+            details.append(f"orderid: {parsed['orderid']}")
+
+        details_text = f" ({', '.join(details)})" if details else ""
+        return f"Автоматически дополнил поля{details_text}."
+
     def handle_stateful_input(self, user_id: int, text: str) -> bool:
         state = self.state.get(user_id) or {}
         step = state.get("step")
@@ -395,8 +469,16 @@ class VkBot:
             if "session" in text.lower():
                 self._fill_trip_field(user_id, "session_id", text)
                 update_trip_template_field(state.get("active_trip"), user_id, "token2", None)
+                autofill_note = self._autofill_trip_template(
+                    state.get("active_trip"), user_id, text, is_session=True
+                )
             else:
                 self._fill_trip_field(user_id, "token2", text)
+                autofill_note = self._autofill_trip_template(
+                    state.get("active_trip"), user_id, text, is_session=False
+                )
+            if autofill_note:
+                self.send(user_id, autofill_note)
             self.update_state(user_id, step="trip_id")
             self.send(user_id, "Введи ID поездки (можно пропустить '-')")
             return True
@@ -449,13 +531,20 @@ class VkBot:
 
         if step == "token":
             if text:
+                notes: list[str] = []
                 if "session" in text.lower() or text.isdigit():
                     data["session_cookie"] = text
                     data.pop("token", None)
+                    notes.extend(self._autofill_from_session(text, data))
                 else:
                     data["token"] = text
                     data.pop("session_cookie", None)
+                    note = self._autofill_from_token(text, data)
+                    if note:
+                        notes.append(note)
                 self.update_state(user_id, data=data)
+                if notes:
+                    self.send(user_id, "\n".join(notes))
                 self._ask_next_field(user_id, "orderid")
                 return True
             return False

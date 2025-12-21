@@ -3322,5 +3322,10 @@ def run_bot_with_restart():
             break
 
 
+def main():
+    """Запустить Telegram-бот с автоматическим рестартом."""
+    run_bot_with_restart()
+
+
 if __name__ == "__main__":
     run_bot_with_restart()
