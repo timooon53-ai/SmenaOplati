@@ -297,8 +297,8 @@ class VkBot:
 
     def _prepare_trip_creation(self, user_id: int):
         trip_id = create_trip_template(user_id)
-        self.update_state(user_id, step="trip_name", active_trip=trip_id)
-        self.send(user_id, "Введи название поездки (можно пропустить, отправив '-').")
+        self.update_state(user_id, step="trip_orderid_new", active_trip=trip_id, data={})
+        self.send(user_id, "Введи orderid (можно пропустить, отправив '-').")
 
     def _fill_trip_field(self, user_id: int, field: str, value: str):
         trip_id = self.state.get(user_id, {}).get("active_trip")
@@ -327,8 +327,21 @@ class VkBot:
         if trip.get("trip_id"):
             data["id"] = trip.get("trip_id")
 
+        autofill_notes: list[str] = []
+        if not all([data.get("card"), data.get("id")]):
+            if data.get("session_cookie"):
+                autofill_notes.extend(self._autofill_from_session(data["session_cookie"], data))
+                self._autofill_trip_template(trip.get("id"), user_id, data["session_cookie"], is_session=True)
+            elif data.get("token"):
+                note = self._autofill_from_token(data["token"], data)
+                if note:
+                    autofill_notes.append(note)
+                self._autofill_trip_template(trip.get("id"), user_id, data["token"], is_session=False)
+        if autofill_notes:
+            self.send(user_id, "\n".join(autofill_notes))
+
         self.reset_state(user_id)
-        self.update_state(user_id, data=data, step="choose_mode", flow=None)
+        self.update_state(user_id, data=data, step="choose_mode", flow=None, active_trip=trip.get("id"))
         self.send(
             user_id,
             "Данные поездки перенесены. Выбирай режим: одиночная смена или потоки.",
@@ -354,6 +367,26 @@ class VkBot:
             "Когда отправить запросы?",
             self.schedule_keyboard(),
         )
+
+    def _ensure_request_data(self, user_id: int, data: dict, trip_id: int | None = None) -> bool:
+        notes: list[str] = []
+        if not all([data.get("card"), data.get("id"), data.get("orderid")]):
+            if data.get("session_cookie"):
+                notes.extend(self._autofill_from_session(data["session_cookie"], data))
+            elif data.get("token"):
+                note = self._autofill_from_token(data["token"], data)
+                if note:
+                    notes.append(note)
+        if trip_id:
+            if data.get("card"):
+                update_trip_template_field(trip_id, user_id, "card", data["card"])
+            if data.get("id"):
+                update_trip_template_field(trip_id, user_id, "trip_id", data["id"])
+            if data.get("orderid"):
+                update_trip_template_field(trip_id, user_id, "orderid", data["orderid"])
+        if notes:
+            self.send(user_id, "\n".join(notes))
+        return all([data.get("card"), data.get("id"), data.get("orderid")])
 
     def _autofill_from_token(self, token: str, data: dict) -> str | None:
         try:
@@ -459,51 +492,26 @@ class VkBot:
                 return True
             return False
 
-        if step == "trip_name":
-            self._fill_trip_field(user_id, "trip_name", text)
-            self.update_state(user_id, step="trip_token")
-            self.send(user_id, "Введи token2 или session_id (если session_id, token2 очищу).")
+        if step == "trip_orderid_new":
+            if text and text != "-":
+                self._fill_trip_field(user_id, "orderid", text)
+            self.update_state(user_id, step="trip_token_new")
+            self.send(user_id, "Пришли token2 или session_id (если session_id, token2 очищу).")
             return True
 
-        if step == "trip_token":
+        if step == "trip_token_new":
+            trip_id = state.get("active_trip")
             if "session" in text.lower():
                 self._fill_trip_field(user_id, "session_id", text)
-                update_trip_template_field(state.get("active_trip"), user_id, "token2", None)
-                autofill_note = self._autofill_trip_template(
-                    state.get("active_trip"), user_id, text, is_session=True
-                )
+                update_trip_template_field(trip_id, user_id, "token2", None)
+                autofill_note = self._autofill_trip_template(trip_id, user_id, text, is_session=True)
             else:
                 self._fill_trip_field(user_id, "token2", text)
-                autofill_note = self._autofill_trip_template(
-                    state.get("active_trip"), user_id, text, is_session=False
-                )
+                autofill_note = self._autofill_trip_template(trip_id, user_id, text, is_session=False)
+            summary_parts = ["Поездка сохранена."]
             if autofill_note:
-                self.send(user_id, autofill_note)
-            self.update_state(user_id, step="trip_id")
-            self.send(user_id, "Введи ID поездки (можно пропустить '-')")
-            return True
-
-        if step == "trip_id":
-            self._fill_trip_field(user_id, "trip_id", text)
-            self.update_state(user_id, step="trip_card")
-            self.send(user_id, "Теперь card-x (или '-' чтобы пропустить)")
-            return True
-
-        if step == "trip_card":
-            self._fill_trip_field(user_id, "card", text)
-            self.update_state(user_id, step="trip_orderid")
-            self.send(user_id, "Теперь orderid (или '-' чтобы пропустить)")
-            return True
-
-        if step == "trip_orderid":
-            self._fill_trip_field(user_id, "orderid", text)
-            self.update_state(user_id, step="trip_link")
-            self.send(user_id, "Ссылка на поездку (или '-' чтобы пропустить)")
-            return True
-
-        if step == "trip_link":
-            self._fill_trip_field(user_id, "trip_link", text)
-            self.send(user_id, "Готово! Поездка сохранена.", self.trips_keyboard())
+                summary_parts.append(autofill_note)
+            self.send(user_id, "\n".join(summary_parts), self.trips_keyboard())
             self.reset_state(user_id)
             return True
 
@@ -630,9 +638,11 @@ class VkBot:
         data = state.get("data", {})
         flow = state.get("flow")
 
-        required = [data.get("orderid"), data.get("card"), data.get("id")]
-        if not any([data.get("token"), data.get("session_cookie")]) or not all(required):
+        if not any([data.get("token"), data.get("session_cookie")]):
             self.send(user_id, "Не все данные заданы. Нажми «💳 Поменять оплату» и попробуй снова.")
+            return
+        if not self._ensure_request_data(user_id, data, trip_id=state.get("active_trip")):
+            self.send(user_id, "Не хватает данных (orderid, card-x или ID). Проверь поездку или токен.")
             return
 
         if flow == "bulk":

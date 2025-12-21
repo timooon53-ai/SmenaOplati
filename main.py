@@ -9,6 +9,7 @@ import tempfile
 import os
 import sys
 import threading
+import signal
 import html
 import time
 from pathlib import Path
