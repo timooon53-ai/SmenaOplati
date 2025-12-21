@@ -3296,13 +3296,19 @@ def build_application() -> "Application":
 
 
 def run_bot_with_restart():
+    stop_signals = (
+        (signal.SIGINT, signal.SIGTERM)
+        if threading.current_thread() is threading.main_thread()
+        else ()
+    )
+
     while True:
         app = build_application()
         try:
             # Явно создаём и устанавливаем новый цикл событий перед запуском,
             # чтобы избежать "There is no current event loop in thread 'MainThread'".
             asyncio.set_event_loop(asyncio.new_event_loop())
-            app.run_polling()
+            app.run_polling(stop_signals=stop_signals or None)
         except KeyboardInterrupt:
             logger.info("Бот остановлен вручную.")
             break
