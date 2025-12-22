@@ -3311,11 +3311,12 @@ def run_bot_with_restart():
     )
 
     while True:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         app = build_application()
         try:
             # Явно создаём и устанавливаем новый цикл событий перед запуском,
-            # чтобы избежать "There is no current event loop in thread 'MainThread'".
-            asyncio.set_event_loop(asyncio.new_event_loop())
+            # чтобы избежать "There is no current event loop" даже при старте в отдельном потоке.
             app.run_polling(stop_signals=stop_signals or None)
         except KeyboardInterrupt:
             logger.info("Бот остановлен вручную.")
@@ -3337,6 +3338,9 @@ def run_bot_with_restart():
             time.sleep(5)
         else:
             break
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
 
 
 def main():
