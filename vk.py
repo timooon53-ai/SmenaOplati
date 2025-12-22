@@ -3,6 +3,8 @@ import logging
 import os
 import threading
 import asyncio
+import time
+from typing import Iterable
 
 import vk_api
 from vk_api.longpoll import VkEventType, VkLongPoll
@@ -17,15 +19,15 @@ from main import (
     get_request_count_for_user,
     list_trip_templates,
     init_db,
-    import_mike_order_to_trip,
     load_proxies,
     proxy_state_text,
     proxies_enabled,
     create_trip_template,
     update_trip_template_field,
     delete_trip_template,
-    fetch_mike_orders,
     session_service,
+    fetch_trip_details_from_token,
+    fetch_session_details,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,23 +60,19 @@ class VkBot:
             "buttons": [
                 [
                     {
-                        "action": {"type": "text", "label": "💳 Поменять оплату"},
+                        "action": {"type": "text", "label": "➕ Добавить поездку"},
                         "color": "primary",
                     },
                     {
-                        "action": {"type": "text", "label": "👤 Профиль"},
+                        "action": {"type": "text", "label": "💳 Поменять оплату"},
                         "color": "secondary",
                     },
                 ],
                 [
                     {
-                        "action": {"type": "text", "label": "🚂 Загрузить поездки"},
+                        "action": {"type": "text", "label": "🗂 Поездки"},
                         "color": "primary",
-                    },
-                    {
-                        "action": {"type": "text", "label": "📜 Логи"},
-                        "color": "secondary",
-                    },
+                    }
                 ],
             ],
         }
@@ -101,34 +99,6 @@ class VkBot:
                         "action": {"type": "text", "label": "🔙 Назад"},
                         "color": "secondary",
                     }
-                ],
-            ],
-        }
-
-    def trips_keyboard(self) -> dict:
-        return {
-            "one_time": False,
-            "inline": False,
-            "buttons": [
-                [
-                    {
-                        "action": {"type": "text", "label": "➕ Добавить поездку"},
-                        "color": "primary",
-                    },
-                    {
-                        "action": {"type": "text", "label": "📋 Мои поездки"},
-                        "color": "secondary",
-                    },
-                ],
-                [
-                    {
-                        "action": {"type": "text", "label": "📥 Из Майка"},
-                        "color": "primary",
-                    },
-                    {
-                        "action": {"type": "text", "label": "🔙 Назад"},
-                        "color": "secondary",
-                    },
                 ],
             ],
         }
@@ -241,6 +211,19 @@ class VkBot:
             session_id = generate_session_id()
             headers = build_headers(data.get("token"), data.get("session_cookie"))
             payload = build_payload(data.get("orderid"), data.get("card"), data.get("id"))
+            last_sent = 0.0
+
+            async def progress_cb(completed: int, success: int, status_code: int, _resp: str | None):
+                nonlocal last_sent
+                now = time.monotonic()
+                if last_sent == 0 or now - last_sent >= 5 or completed == total_requests:
+                    msg = (
+                        f"Сессия {session_id}: {completed}/{total_requests} завершено. "
+                        f"Успехов: {success}"
+                    )
+                    await asyncio.to_thread(self.send, user_id, msg)
+                    last_sent = now
+
             completed, success = await session_service.run_bulk(
                 user_id,
                 headers,
@@ -249,58 +232,60 @@ class VkBot:
                 total_requests,
                 threads,
                 session_id,
+                progress_cb=progress_cb,
             )
             return session_id, completed, success
 
         return asyncio.run(_job())
 
-    def start_data_collection(self, user_id: int):
-        self.update_state(user_id, step="choose_mode", data={}, timer=None)
-        self.send(
-            user_id,
-            "Выбирай режим: одиночная смена или потоки.",
-            self.mode_keyboard(),
-        )
-
     def _format_trip(self, idx: int, trip: dict) -> str:
+        created = trip.get("created_at") or ""
+        created_short = str(created)[:19] if created else "—"
         name = trip.get("trip_name") or f"Поездка #{trip.get('id')}"
-        notes = []
-        if trip.get("token2"):
-            notes.append("token2")
-        if trip.get("session_id"):
-            notes.append("session_id")
-        if trip.get("trip_id"):
-            notes.append(f"ID: {trip['trip_id']}")
+        parts = [f"{idx}) {name} • добавлена {created_short}"]
+        fields = []
         if trip.get("orderid"):
-            notes.append(f"orderid: {trip['orderid']}")
+            fields.append(f"orderid: {trip['orderid']}")
+        if trip.get("trip_id"):
+            fields.append(f"ID: {trip['trip_id']}")
         if trip.get("card"):
-            notes.append(f"card-x: {trip['card']}")
-        if trip.get("trip_link"):
-            notes.append("ссылка есть")
-        note_text = ", ".join(notes) if notes else "пусто"
-        return f"{idx}. {name} (id={trip.get('id')}): {note_text}"
+            fields.append(f"card-x: {trip['card']}")
+        if trip.get("token2"):
+            fields.append("token2 ✓")
+        if trip.get("session_id"):
+            fields.append("session_id ✓")
+        parts.append(", ".join(fields) if fields else "пусто")
+        return "\n".join(parts)
 
     def _send_trips_list(self, user_id: int):
         trips = list_trip_templates(user_id)
         if not trips:
-            self.send(user_id, "У тебя пока нет поездок. Добавь новую.", self.trips_keyboard())
+            self.send(user_id, "У тебя пока нет поездок. Добавь новую.", self.start_keyboard())
             return
         lines = ["📋 Твои поездки:"]
         for idx, trip in enumerate(trips, start=1):
             lines.append(self._format_trip(idx, trip))
-        lines.append("\nНапиши номер, чтобы использовать её. Напиши 'удалить N' чтобы удалить.")
+        lines.append(
+            "\nНапиши номер, чтобы использовать её.\n"
+            "Напиши 'данные N' — показать параметры.\n"
+            "Напиши 'удалить N' — удалить.\n"
+            "Напиши 'очистить все' — удалить все поездки."
+        )
         self.update_state(user_id, step="trip_list", trips=trips)
-        self.send(user_id, "\n".join(lines), self.trips_keyboard())
+        self.send(user_id, "\n".join(lines), self.start_keyboard())
 
     def _prepare_trip_creation(self, user_id: int):
         trip_id = create_trip_template(user_id)
-        self.update_state(user_id, step="trip_name", active_trip=trip_id)
-        self.send(user_id, "Введи название поездки (можно пропустить, отправив '-').")
+        self.update_state(user_id, step="trip_orderid_new", active_trip=trip_id, data={})
+        self.send(
+            user_id,
+            "Введи orderid.\nПосле этого пришли token2 — карту и ID подставлю автоматически.",
+        )
 
     def _fill_trip_field(self, user_id: int, field: str, value: str):
         trip_id = self.state.get(user_id, {}).get("active_trip")
         if not trip_id:
-            self.send(user_id, "Не нашёл активную поездку, начни заново.", self.trips_keyboard())
+            self.send(user_id, "Не нашёл активную поездку, начни заново.", self.start_keyboard())
             return False
         if value and value != "-":
             update_trip_template_field(trip_id, user_id, field, value)
@@ -310,7 +295,7 @@ class VkBot:
         token = trip.get("token2")
         session_cookie = trip.get("session_id")
         if not token and not session_cookie:
-            self.send(user_id, "В этой поездке нет token2/session_id. Заполни и попробуй снова.", self.trips_keyboard())
+            self.send(user_id, "В этой поездке нет token2/session_id. Заполни и попробуй снова.", self.start_keyboard())
             return
         data = {}
         if session_cookie:
@@ -324,8 +309,21 @@ class VkBot:
         if trip.get("trip_id"):
             data["id"] = trip.get("trip_id")
 
+        autofill_notes: list[str] = []
+        if not all([data.get("card"), data.get("id")]):
+            if data.get("session_cookie"):
+                autofill_notes.extend(self._autofill_from_session(data["session_cookie"], data))
+                self._autofill_trip_template(trip.get("id"), user_id, data["session_cookie"], is_session=True)
+            elif data.get("token"):
+                note = self._autofill_from_token(data["token"], data)
+                if note:
+                    autofill_notes.append(note)
+                self._autofill_trip_template(trip.get("id"), user_id, data["token"], is_session=False)
+        if autofill_notes:
+            self.send(user_id, "\n".join(autofill_notes))
+
         self.reset_state(user_id)
-        self.update_state(user_id, data=data, step="choose_mode", flow=None)
+        self.update_state(user_id, data=data, step="choose_mode", flow=None, active_trip=trip.get("id"))
         self.send(
             user_id,
             "Данные поездки перенесены. Выбирай режим: одиночная смена или потоки.",
@@ -352,6 +350,97 @@ class VkBot:
             self.schedule_keyboard(),
         )
 
+    def _ensure_request_data(self, user_id: int, data: dict, trip_id: int | None = None) -> bool:
+        notes: list[str] = []
+        if not all([data.get("card"), data.get("id"), data.get("orderid")]):
+            if data.get("session_cookie"):
+                notes.extend(self._autofill_from_session(data["session_cookie"], data))
+            elif data.get("token"):
+                note = self._autofill_from_token(data["token"], data)
+                if note:
+                    notes.append(note)
+        if trip_id:
+            if data.get("card"):
+                update_trip_template_field(trip_id, user_id, "card", data["card"])
+            if data.get("id"):
+                update_trip_template_field(trip_id, user_id, "trip_id", data["id"])
+            if data.get("orderid"):
+                update_trip_template_field(trip_id, user_id, "orderid", data["orderid"])
+        if notes:
+            self.send(user_id, "\n".join(notes))
+        return all([data.get("card"), data.get("id"), data.get("orderid")])
+
+    def _autofill_from_token(self, token: str, data: dict) -> str | None:
+        try:
+            parsed = asyncio.run(fetch_trip_details_from_token(token))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось автоматически получить данные по token2: %s", exc)
+            return None
+
+        notes = []
+        if parsed.get("trip_id") and not data.get("id"):
+            data["id"] = parsed["trip_id"]
+            notes.append(f"ID: {parsed['trip_id']}")
+        if parsed.get("card") and not data.get("card"):
+            data["card"] = parsed["card"]
+            notes.append(f"card-x: {parsed['card']}")
+
+        if not notes:
+            return None
+        return "Нашёл в token2: " + ", ".join(notes)
+
+    def _autofill_from_session(self, session_id: str, data: dict) -> Iterable[str]:
+        try:
+            parsed = asyncio.run(fetch_session_details(session_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось автоматически получить данные по session_id: %s", exc)
+            return []
+
+        notes: list[str] = []
+        if parsed.get("trip_id") and not data.get("id"):
+            data["id"] = parsed["trip_id"]
+            notes.append(f"ID: {parsed['trip_id']}")
+        if parsed.get("card") and not data.get("card"):
+            data["card"] = parsed["card"]
+            notes.append(f"card-x: {parsed['card']}")
+        if parsed.get("orderid") and not data.get("orderid"):
+            data["orderid"] = parsed["orderid"]
+            notes.append(f"orderid: {parsed['orderid']}")
+        return notes
+
+    def _autofill_trip_template(self, trip_id: int, user_id: int, source: str, is_session: bool):
+        try:
+            parsed = (
+                asyncio.run(fetch_session_details(source))
+                if is_session
+                else asyncio.run(fetch_trip_details_from_token(source))
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось автозаполнить поездку (%s): %s", source, exc)
+            return None
+
+        updated_fields: list[str] = []
+
+        for field in ("trip_id", "card", "orderid"):
+            value = parsed.get(field)
+            if value:
+                update_trip_template_field(trip_id, user_id, field, value)
+                updated_fields.append(field)
+
+        if not updated_fields:
+            return None
+
+        details = []
+        if parsed.get("trip_id"):
+            details.append(f"ID: {parsed['trip_id']}")
+        if parsed.get("card"):
+            details.append(f"card-x: {parsed['card']}")
+        if parsed.get("orderid"):
+            details.append(f"orderid: {parsed['orderid']}")
+
+        details_text = f" ({', '.join(details)})" if details else ""
+        return f"Автоматически дополнил поля{details_text}."
+
     def handle_stateful_input(self, user_id: int, text: str) -> bool:
         state = self.state.get(user_id) or {}
         step = state.get("step")
@@ -361,67 +450,29 @@ class VkBot:
         if step == "choose_mode":
             return self.handle_change_payment_mode(user_id, text)
 
-        if step == "trip_menu":
-            lowered = text.lower()
-            if lowered in {"➕ добавить поездку", "добавить поездку"}:
-                self._prepare_trip_creation(user_id)
+        if step == "trip_orderid_new":
+            if not text:
+                self.send(user_id, "Нужно указать orderid (без него не получится).")
                 return True
-            if lowered in {"📋 мои поездки", "мои поездки"}:
-                self._send_trips_list(user_id)
-                return True
-            if lowered in {"📥 из майка", "из майка"}:
-                orders = fetch_mike_orders()
-                if not orders:
-                    self.send(user_id, "Не нашёл заказов в базе Майка.", self.trips_keyboard())
-                    return True
-                for order in orders[:10]:
-                    import_mike_order_to_trip(order, user_id)
-                self.send(user_id, "Импортировал последние заказы. Теперь выбери поездку.", self.trips_keyboard())
-                self._send_trips_list(user_id)
-                return True
-            if lowered == "🔙 назад":
-                self.reset_state(user_id)
-                self.send(user_id, "Возврат в главное меню.", self.start_keyboard())
-                return True
-            return False
-
-        if step == "trip_name":
-            self._fill_trip_field(user_id, "trip_name", text)
-            self.update_state(user_id, step="trip_token")
-            self.send(user_id, "Введи token2 или session_id (если session_id, token2 очищу).")
-            return True
-
-        if step == "trip_token":
-            if "session" in text.lower():
-                self._fill_trip_field(user_id, "session_id", text)
-                update_trip_template_field(state.get("active_trip"), user_id, "token2", None)
-            else:
-                self._fill_trip_field(user_id, "token2", text)
-            self.update_state(user_id, step="trip_id")
-            self.send(user_id, "Введи ID поездки (можно пропустить '-')")
-            return True
-
-        if step == "trip_id":
-            self._fill_trip_field(user_id, "trip_id", text)
-            self.update_state(user_id, step="trip_card")
-            self.send(user_id, "Теперь card-x (или '-' чтобы пропустить)")
-            return True
-
-        if step == "trip_card":
-            self._fill_trip_field(user_id, "card", text)
-            self.update_state(user_id, step="trip_orderid")
-            self.send(user_id, "Теперь orderid (или '-' чтобы пропустить)")
-            return True
-
-        if step == "trip_orderid":
             self._fill_trip_field(user_id, "orderid", text)
-            self.update_state(user_id, step="trip_link")
-            self.send(user_id, "Ссылка на поездку (или '-' чтобы пропустить)")
+            self.update_state(user_id, step="trip_token_new")
+            self.send(user_id, "Пришли token2. Карту и ID найду сам.")
             return True
 
-        if step == "trip_link":
-            self._fill_trip_field(user_id, "trip_link", text)
-            self.send(user_id, "Готово! Поездка сохранена.", self.trips_keyboard())
+        if step == "trip_token_new":
+            trip_id = state.get("active_trip")
+            if not text:
+                self.send(user_id, "Нужен token2, чтобы продолжить.")
+                return True
+            self._fill_trip_field(user_id, "token2", text)
+            autofill_note = self._autofill_trip_template(trip_id, user_id, text, is_session=False)
+            summary_parts = ["Поездка сохранена."]
+            if autofill_note:
+                summary_parts.append(autofill_note)
+            trip = list_trip_templates(user_id)[0] if list_trip_templates(user_id) else None
+            if trip:
+                summary_parts.append("Текущие данные:\n" + self._format_trip(1, trip))
+            self.send(user_id, "\n".join(summary_parts), self.start_keyboard())
             self.reset_state(user_id)
             return True
 
@@ -432,30 +483,52 @@ class VkBot:
                     idx = int(lowered.replace("удалить", "").strip())
                     trip = trips[idx - 1]
                 except Exception:  # noqa: BLE001
-                    self.send(user_id, "Не понял номер для удаления.", self.trips_keyboard())
+                    self.send(user_id, "Не понял номер для удаления.", self.start_keyboard())
                     return True
                 delete_trip_template(trip.get("id"), user_id)
-                self.send(user_id, "Удалил поездку.", self.trips_keyboard())
+                self.send(user_id, "Удалил поездку.", self.start_keyboard())
+                self._send_trips_list(user_id)
+                return True
+            if lowered.startswith("данные"):
+                try:
+                    idx = int(lowered.replace("данные", "").strip())
+                    trip = trips[idx - 1]
+                except Exception:  # noqa: BLE001
+                    self.send(user_id, "Не понял номер для просмотра.", self.start_keyboard())
+                    return True
+                self.send(user_id, self._format_trip(idx, trip), self.start_keyboard())
+                return True
+            if lowered == "очистить все":
+                for trip in trips:
+                    delete_trip_template(trip.get("id"), user_id)
+                self.send(user_id, "Все поездки удалены.", self.start_keyboard())
                 self._send_trips_list(user_id)
                 return True
             try:
                 idx = int(text)
                 trip = trips[idx - 1]
             except Exception:  # noqa: BLE001
-                self.send(user_id, "Напиши номер поездки или 'удалить N'.", self.trips_keyboard())
+                self.send(user_id, "Напиши номер поездки или 'удалить N'.", self.start_keyboard())
                 return True
             self._use_trip(user_id, trip)
             return True
 
         if step == "token":
             if text:
+                notes: list[str] = []
                 if "session" in text.lower() or text.isdigit():
                     data["session_cookie"] = text
                     data.pop("token", None)
+                    notes.extend(self._autofill_from_session(text, data))
                 else:
                     data["token"] = text
                     data.pop("session_cookie", None)
+                    note = self._autofill_from_token(text, data)
+                    if note:
+                        notes.append(note)
                 self.update_state(user_id, data=data)
+                if notes:
+                    self.send(user_id, "\n".join(notes))
                 self._ask_next_field(user_id, "orderid")
                 return True
             return False
@@ -541,9 +614,11 @@ class VkBot:
         data = state.get("data", {})
         flow = state.get("flow")
 
-        required = [data.get("orderid"), data.get("card"), data.get("id")]
-        if not any([data.get("token"), data.get("session_cookie")]) or not all(required):
+        if not any([data.get("token"), data.get("session_cookie")]):
             self.send(user_id, "Не все данные заданы. Нажми «💳 Поменять оплату» и попробуй снова.")
+            return
+        if not self._ensure_request_data(user_id, data, trip_id=state.get("active_trip")):
+            self.send(user_id, "Не хватает данных (orderid, card-x или ID). Проверь поездку или токен.")
             return
 
         if flow == "bulk":
@@ -555,7 +630,7 @@ class VkBot:
 
             self.send(
                 user_id,
-                "Запускаю массовую отправку. Каждые 5 секунд идёт логирование в БД.",
+                "Запускаю массовую отправку. Каждые 5 секунд присылаю прогресс и пишу в БД.",
                 self.start_keyboard(),
             )
             session_id, completed, success = self._run_bulk(user_id, data, threads, total)
@@ -608,31 +683,20 @@ class VkBot:
         if self.handle_stateful_input(user_id, text):
             return
 
-        if text == "👤 Профиль" or lowered == "профиль":
-            self.handle_profile(user_id)
+        if text == "➕ Добавить поездку":
+            self.reset_state(user_id)
+            self._prepare_trip_creation(user_id)
             return
 
         if text == "💳 Поменять оплату":
-            self.start_data_collection(user_id)
-            return
-
-        if text == "📜 Логи":
-            self.send(
-                user_id,
-                "Логи можно выгрузить по ID сессии через Телеграм-бота."
-                " В VK логирование продолжается автоматически.",
-                self.start_keyboard(),
-            )
-            return
-
-        if text == "🚂 Загрузить поездки":
             self.reset_state(user_id)
-            self.update_state(user_id, step="trip_menu", data={}, trips=[])
-            self.send(
-                user_id,
-                "Управление поездками: добавляй, используй и удаляй шаблоны.",
-                self.trips_keyboard(),
-            )
+            self._send_trips_list(user_id)
+            self.send(user_id, "Выбери поездку номером и запусти смену или потоки.", self.start_keyboard())
+            return
+
+        if text == "🗂 Поездки":
+            self.reset_state(user_id)
+            self._send_trips_list(user_id)
             return
 
         self.send(user_id, "Не понял команду, используй кнопки ниже.", self.start_keyboard())

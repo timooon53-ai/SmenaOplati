@@ -9,6 +9,7 @@ import tempfile
 import os
 import sys
 import threading
+import signal
 import html
 import time
 from pathlib import Path
@@ -25,7 +26,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import ExtBot
 from telegram.ext import (
     ApplicationBuilder,
@@ -137,6 +138,12 @@ async def send_with_retry(
         except RetryAfter as exc:
             last_exc = exc
             await asyncio.sleep(exc.retry_after)
+        except Conflict as exc:
+            last_exc = exc
+            logger.error("Получен Conflict от Telegram (скорее всего, второй инстанс бота): %s", exc)
+            if raise_on_failure:
+                raise
+            break
         except (TimedOut, NetworkError, asyncio.TimeoutError, aiohttp.ClientError) as exc:
             last_exc = exc
             logger.warning(
@@ -3289,6 +3296,7 @@ def build_application() -> "Application":
             CommandHandler("start", start),  # <--- добавили
             CommandHandler("request", request_restart),
         ],
+        per_message=False,
     )
 
     app.add_handler(conv)
@@ -3296,15 +3304,24 @@ def build_application() -> "Application":
 
 
 def run_bot_with_restart():
+    stop_signals = (
+        (signal.SIGINT, signal.SIGTERM)
+        if threading.current_thread() is threading.main_thread()
+        else ()
+    )
+
     while True:
         app = build_application()
         try:
             # Явно создаём и устанавливаем новый цикл событий перед запуском,
             # чтобы избежать "There is no current event loop in thread 'MainThread'".
             asyncio.set_event_loop(asyncio.new_event_loop())
-            app.run_polling()
+            app.run_polling(stop_signals=stop_signals or None)
         except KeyboardInterrupt:
             logger.info("Бот остановлен вручную.")
+            break
+        except Conflict:
+            logger.error("Найден другой активный инстанс бота (409 Conflict). Останавливаемся без рестарта.")
             break
         except Exception:
             logger.exception(
@@ -3320,6 +3337,11 @@ def run_bot_with_restart():
             time.sleep(5)
         else:
             break
+
+
+def main():
+    """Запустить Telegram-бот с автоматическим рестартом."""
+    run_bot_with_restart()
 
 
 if __name__ == "__main__":
