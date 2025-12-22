@@ -26,7 +26,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import ExtBot
 from telegram.ext import (
     ApplicationBuilder,
@@ -3290,6 +3290,7 @@ def build_application() -> "Application":
             CommandHandler("start", start),  # <--- добавили
             CommandHandler("request", request_restart),
         ],
+        per_message=True,
     )
 
     app.add_handler(conv)
@@ -3312,6 +3313,9 @@ def run_bot_with_restart():
             app.run_polling(stop_signals=stop_signals or None)
         except KeyboardInterrupt:
             logger.info("Бот остановлен вручную.")
+            break
+        except Conflict:
+            logger.error("Найден другой активный инстанс бота (409 Conflict). Останавливаемся без рестарта.")
             break
         except Exception:
             logger.exception(
