@@ -279,7 +279,7 @@ class VkBot:
         self.update_state(user_id, step="trip_orderid_new", active_trip=trip_id, data={})
         self.send(
             user_id,
-            "Введи orderid (можно пропустить, отправив '-'). Затем пришли token2/session_id — карту и ID я подставлю сам.",
+            "Введи orderid.\nПосле этого пришли token2 — карту и ID подставлю автоматически.",
         )
 
     def _fill_trip_field(self, user_id: int, field: str, value: str):
@@ -451,26 +451,21 @@ class VkBot:
             return self.handle_change_payment_mode(user_id, text)
 
         if step == "trip_orderid_new":
-            if not text or text == "-":
+            if not text:
                 self.send(user_id, "Нужно указать orderid (без него не получится).")
                 return True
             self._fill_trip_field(user_id, "orderid", text)
             self.update_state(user_id, step="trip_token_new")
-            self.send(user_id, "Пришли token2 или session_id (если session_id, token2 очищу).")
+            self.send(user_id, "Пришли token2. Карту и ID найду сам.")
             return True
 
         if step == "trip_token_new":
             trip_id = state.get("active_trip")
             if not text:
-                self.send(user_id, "Нужен token2 или session_id, чтобы продолжить.")
+                self.send(user_id, "Нужен token2, чтобы продолжить.")
                 return True
-            if "session" in text.lower():
-                self._fill_trip_field(user_id, "session_id", text)
-                update_trip_template_field(trip_id, user_id, "token2", None)
-                autofill_note = self._autofill_trip_template(trip_id, user_id, text, is_session=True)
-            else:
-                self._fill_trip_field(user_id, "token2", text)
-                autofill_note = self._autofill_trip_template(trip_id, user_id, text, is_session=False)
+            self._fill_trip_field(user_id, "token2", text)
+            autofill_note = self._autofill_trip_template(trip_id, user_id, text, is_session=False)
             summary_parts = ["Поездка сохранена."]
             if autofill_note:
                 summary_parts.append(autofill_note)
