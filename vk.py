@@ -211,18 +211,6 @@ class VkBot:
             session_id = generate_session_id()
             headers = build_headers(data.get("token"), data.get("session_cookie"))
             payload = build_payload(data.get("orderid"), data.get("card"), data.get("id"))
-            last_sent = 0.0
-
-            async def progress_cb(completed: int, success: int, status_code: int, _resp: str | None):
-                nonlocal last_sent
-                now = time.monotonic()
-                if last_sent == 0 or now - last_sent >= 5 or completed == total_requests:
-                    msg = (
-                        f"Сессия {session_id}: {completed}/{total_requests} завершено. "
-                        f"Успехов: {success}"
-                    )
-                    await asyncio.to_thread(self.send, user_id, msg)
-                    last_sent = now
 
             completed, success = await session_service.run_bulk(
                 user_id,
@@ -232,7 +220,6 @@ class VkBot:
                 total_requests,
                 threads,
                 session_id,
-                progress_cb=progress_cb,
             )
             return session_id, completed, success
 
@@ -630,7 +617,7 @@ class VkBot:
 
             self.send(
                 user_id,
-                "Запускаю массовую отправку. Каждые 5 секунд присылаю прогресс и пишу в БД.",
+                "Запускаю массовую отправку. После завершения пришлю сводку и запишу логи в БД.",
                 self.start_keyboard(),
             )
             session_id, completed, success = self._run_bulk(user_id, data, threads, total)
