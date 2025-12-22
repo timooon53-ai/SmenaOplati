@@ -62,14 +62,18 @@ class VkBot:
                     {
                         "action": {"type": "text", "label": "➕ Добавить поездку"},
                         "color": "primary",
-                    }
-                ],
-                [
+                    },
                     {
                         "action": {"type": "text", "label": "💳 Поменять оплату"},
                         "color": "secondary",
+                    },
+                ],
+                [
+                    {
+                        "action": {"type": "text", "label": "🗂 Поездки"},
+                        "color": "primary",
                     }
-                ]
+                ],
             ],
         }
 
@@ -235,22 +239,23 @@ class VkBot:
         return asyncio.run(_job())
 
     def _format_trip(self, idx: int, trip: dict) -> str:
+        created = trip.get("created_at") or ""
+        created_short = str(created)[:19] if created else "—"
         name = trip.get("trip_name") or f"Поездка #{trip.get('id')}"
-        notes = []
-        if trip.get("token2"):
-            notes.append("token2")
-        if trip.get("session_id"):
-            notes.append("session_id")
-        if trip.get("trip_id"):
-            notes.append(f"ID: {trip['trip_id']}")
+        parts = [f"{idx}) {name} • добавлена {created_short}"]
+        fields = []
         if trip.get("orderid"):
-            notes.append(f"orderid: {trip['orderid']}")
+            fields.append(f"orderid: {trip['orderid']}")
+        if trip.get("trip_id"):
+            fields.append(f"ID: {trip['trip_id']}")
         if trip.get("card"):
-            notes.append(f"card-x: {trip['card']}")
-        if trip.get("trip_link"):
-            notes.append("ссылка есть")
-        note_text = ", ".join(notes) if notes else "пусто"
-        return f"{idx}. {name} (id={trip.get('id')}): {note_text}"
+            fields.append(f"card-x: {trip['card']}")
+        if trip.get("token2"):
+            fields.append("token2 ✓")
+        if trip.get("session_id"):
+            fields.append("session_id ✓")
+        parts.append(", ".join(fields) if fields else "пусто")
+        return "\n".join(parts)
 
     def _send_trips_list(self, user_id: int):
         trips = list_trip_templates(user_id)
@@ -263,7 +268,8 @@ class VkBot:
         lines.append(
             "\nНапиши номер, чтобы использовать её.\n"
             "Напиши 'данные N' — показать параметры.\n"
-            "Напиши 'удалить N' — удалить."
+            "Напиши 'удалить N' — удалить.\n"
+            "Напиши 'очистить все' — удалить все поездки."
         )
         self.update_state(user_id, step="trip_list", trips=trips)
         self.send(user_id, "\n".join(lines), self.start_keyboard())
@@ -445,14 +451,19 @@ class VkBot:
             return self.handle_change_payment_mode(user_id, text)
 
         if step == "trip_orderid_new":
-            if text and text != "-":
-                self._fill_trip_field(user_id, "orderid", text)
+            if not text or text == "-":
+                self.send(user_id, "Нужно указать orderid (без него не получится).")
+                return True
+            self._fill_trip_field(user_id, "orderid", text)
             self.update_state(user_id, step="trip_token_new")
             self.send(user_id, "Пришли token2 или session_id (если session_id, token2 очищу).")
             return True
 
         if step == "trip_token_new":
             trip_id = state.get("active_trip")
+            if not text:
+                self.send(user_id, "Нужен token2 или session_id, чтобы продолжить.")
+                return True
             if "session" in text.lower():
                 self._fill_trip_field(user_id, "session_id", text)
                 update_trip_template_field(trip_id, user_id, "token2", None)
@@ -463,9 +474,9 @@ class VkBot:
             summary_parts = ["Поездка сохранена."]
             if autofill_note:
                 summary_parts.append(autofill_note)
-            trip = list_trip_templates(user_id)[-1] if list_trip_templates(user_id) else None
+            trip = list_trip_templates(user_id)[0] if list_trip_templates(user_id) else None
             if trip:
-                summary_parts.append(self._format_trip(1, trip))
+                summary_parts.append("Текущие данные:\n" + self._format_trip(1, trip))
             self.send(user_id, "\n".join(summary_parts), self.start_keyboard())
             self.reset_state(user_id)
             return True
@@ -491,6 +502,12 @@ class VkBot:
                     self.send(user_id, "Не понял номер для просмотра.", self.start_keyboard())
                     return True
                 self.send(user_id, self._format_trip(idx, trip), self.start_keyboard())
+                return True
+            if lowered == "очистить все":
+                for trip in trips:
+                    delete_trip_template(trip.get("id"), user_id)
+                self.send(user_id, "Все поездки удалены.", self.start_keyboard())
+                self._send_trips_list(user_id)
                 return True
             try:
                 idx = int(text)
@@ -677,6 +694,12 @@ class VkBot:
             return
 
         if text == "💳 Поменять оплату":
+            self.reset_state(user_id)
+            self._send_trips_list(user_id)
+            self.send(user_id, "Выбери поездку номером и запусти смену или потоки.", self.start_keyboard())
+            return
+
+        if text == "🗂 Поездки":
             self.reset_state(user_id)
             self._send_trips_list(user_id)
             return
