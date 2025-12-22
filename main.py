@@ -141,6 +141,8 @@ async def send_with_retry(
         except Conflict as exc:
             last_exc = exc
             logger.error("Получен Conflict от Telegram (скорее всего, второй инстанс бота): %s", exc)
+            if raise_on_failure:
+                raise
             break
         except (TimedOut, NetworkError, asyncio.TimeoutError, aiohttp.ClientError) as exc:
             last_exc = exc
@@ -3294,6 +3296,7 @@ def build_application() -> "Application":
             CommandHandler("start", start),  # <--- добавили
             CommandHandler("request", request_restart),
         ],
+        per_message=False,
     )
 
     app.add_handler(conv)
