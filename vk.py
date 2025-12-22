@@ -271,7 +271,10 @@ class VkBot:
     def _prepare_trip_creation(self, user_id: int):
         trip_id = create_trip_template(user_id)
         self.update_state(user_id, step="trip_orderid_new", active_trip=trip_id, data={})
-        self.send(user_id, "Введи orderid (можно пропустить, отправив '-').")
+        self.send(
+            user_id,
+            "Введи orderid (можно пропустить, отправив '-'). Затем пришли token2/session_id — карту и ID я подставлю сам.",
+        )
 
     def _fill_trip_field(self, user_id: int, field: str, value: str):
         trip_id = self.state.get(user_id, {}).get("active_trip")
@@ -460,6 +463,9 @@ class VkBot:
             summary_parts = ["Поездка сохранена."]
             if autofill_note:
                 summary_parts.append(autofill_note)
+            trip = list_trip_templates(user_id)[-1] if list_trip_templates(user_id) else None
+            if trip:
+                summary_parts.append(self._format_trip(1, trip))
             self.send(user_id, "\n".join(summary_parts), self.start_keyboard())
             self.reset_state(user_id)
             return True
@@ -612,7 +618,7 @@ class VkBot:
 
             self.send(
                 user_id,
-                "Запускаю массовую отправку. Каждые 5 секунд идёт логирование в БД.",
+                "Запускаю массовую отправку. Каждые 5 секунд присылаю прогресс и пишу в БД.",
                 self.start_keyboard(),
             )
             session_id, completed, success = self._run_bulk(user_id, data, threads, total)
