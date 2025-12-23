@@ -1,4 +1,11 @@
-BLOCK:Parse
+# -*- coding: utf-8 -*-
+"""Архивный шаблон исходного сценария (не исполняется).
+
+Файл оставлен только как текст для справки, весь контент завернут
+в строковую константу, чтобы инструменты вроде ``compileall`` не падали.
+"""
+
+PYTHON_TEMPLATE = r"""BLOCK:Parse
   input = @data.SOURCE
   prefix = "ss"
   MODE:LR
@@ -167,3 +174,4 @@ BLOCK:FileAppendLines
   path = "y/user.txt"
   lines = $["<id> | <card> | <ss> "]
 ENDBLOCK
+"""

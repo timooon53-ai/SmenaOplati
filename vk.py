@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 VK_TOKEN = VK_TOKEN
+VK_PLATFORM = "vk"
 
 
 class VkBot:
@@ -199,7 +200,7 @@ class VkBot:
             headers = build_headers(data.get("token"), data.get("session_cookie"))
             payload = build_payload(data.get("orderid"), data.get("card"), data.get("id"))
             ok, status, resp = await do_single_request_and_log(
-                user_id, headers, payload, session_id, proxies_enabled()
+                user_id, headers, payload, session_id, proxies_enabled(), platform=VK_PLATFORM
             )
             return session_id, ok, status, resp
 
@@ -219,6 +220,7 @@ class VkBot:
                 total_requests,
                 threads,
                 session_id,
+                platform=VK_PLATFORM,
             )
             return session_id, completed, success
 
@@ -244,7 +246,7 @@ class VkBot:
         return "\n".join(parts)
 
     def _send_trips_list(self, user_id: int):
-        trips = list_trip_templates(user_id)
+        trips = list_trip_templates(user_id, platform=VK_PLATFORM)
         if not trips:
             self.send(user_id, "У тебя пока нет поездок. Добавь новую.", self.start_keyboard())
             return
@@ -261,7 +263,7 @@ class VkBot:
         self.send(user_id, "\n".join(lines), self.start_keyboard())
 
     def _prepare_trip_creation(self, user_id: int):
-        trip_id = create_trip_template(user_id)
+        trip_id = create_trip_template(user_id, platform=VK_PLATFORM)
         self.update_state(user_id, step="trip_orderid_new", active_trip=trip_id, data={})
         self.send(
             user_id,
@@ -274,7 +276,7 @@ class VkBot:
             self.send(user_id, "Не нашёл активную поездку, начни заново.", self.start_keyboard())
             return False
         if value and value != "-":
-            update_trip_template_field(trip_id, user_id, field, value)
+            update_trip_template_field(trip_id, user_id, field, value, platform=VK_PLATFORM)
         return True
 
     def _use_trip(self, user_id: int, trip: dict):
@@ -347,11 +349,11 @@ class VkBot:
                     notes.append(note)
         if trip_id:
             if data.get("card"):
-                update_trip_template_field(trip_id, user_id, "card", data["card"])
+                update_trip_template_field(trip_id, user_id, "card", data["card"], platform=VK_PLATFORM)
             if data.get("id"):
-                update_trip_template_field(trip_id, user_id, "trip_id", data["id"])
+                update_trip_template_field(trip_id, user_id, "trip_id", data["id"], platform=VK_PLATFORM)
             if data.get("orderid"):
-                update_trip_template_field(trip_id, user_id, "orderid", data["orderid"])
+                update_trip_template_field(trip_id, user_id, "orderid", data["orderid"], platform=VK_PLATFORM)
         if notes:
             self.send(user_id, "\n".join(notes))
         return all([data.get("card"), data.get("id"), data.get("orderid")])
@@ -410,7 +412,7 @@ class VkBot:
         for field in ("trip_id", "card", "orderid"):
             value = parsed.get(field)
             if value:
-                update_trip_template_field(trip_id, user_id, field, value)
+                update_trip_template_field(trip_id, user_id, field, value, platform=VK_PLATFORM)
                 updated_fields.append(field)
 
         if not updated_fields:
@@ -455,7 +457,8 @@ class VkBot:
             summary_parts = ["Поездка сохранена."]
             if autofill_note:
                 summary_parts.append(autofill_note)
-            trip = list_trip_templates(user_id)[0] if list_trip_templates(user_id) else None
+            trips = list_trip_templates(user_id, platform=VK_PLATFORM)
+            trip = trips[0] if trips else None
             if trip:
                 summary_parts.append("Текущие данные:\n" + self._format_trip(1, trip))
             self.send(user_id, "\n".join(summary_parts), self.start_keyboard())
@@ -471,7 +474,7 @@ class VkBot:
                 except Exception:  # noqa: BLE001
                     self.send(user_id, "Не понял номер для удаления.", self.start_keyboard())
                     return True
-                delete_trip_template(trip.get("id"), user_id)
+                delete_trip_template(trip.get("id"), user_id, platform=VK_PLATFORM)
                 self.send(user_id, "Удалил поездку.", self.start_keyboard())
                 self._send_trips_list(user_id)
                 return True
@@ -486,7 +489,7 @@ class VkBot:
                 return True
             if lowered == "очистить все":
                 for trip in trips:
-                    delete_trip_template(trip.get("id"), user_id)
+                    delete_trip_template(trip.get("id"), user_id, platform=VK_PLATFORM)
                 self.send(user_id, "Все поездки удалены.", self.start_keyboard())
                 self._send_trips_list(user_id)
                 return True
@@ -638,7 +641,7 @@ class VkBot:
         self.reset_state(user_id)
 
     def handle_profile(self, user_id: int):
-        total_requests = get_request_count_for_user(user_id)
+        total_requests = get_request_count_for_user(user_id, platform=VK_PLATFORM)
         text = (
             "👤 Профиль\n\n"
             f"VK ID: {user_id}\n"

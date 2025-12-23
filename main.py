@@ -207,16 +207,34 @@ class ChangePaymentClient:
     def __init__(self, base_url: str):
         self.base_url = base_url
         self.proxy_pool: List[str] = []
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._sessions: dict[int, aiohttp.ClientSession] = {}
+        self._sessions_lock = threading.Lock()
+
+    async def _get_or_create_session(self) -> aiohttp.ClientSession:
+        loop_id = id(asyncio.get_running_loop())
+        with self._sessions_lock:
+            session = self._sessions.get(loop_id)
+
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+            with self._sessions_lock:
+                self._sessions[loop_id] = session
+
+        return session
 
     async def start(self):
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
+        await self._get_or_create_session()
 
     async def close(self):
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        with self._sessions_lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+
+        for session in sessions:
+            try:
+                await session.close()
+            except Exception:
+                logger.debug("Не удалось закрыть aiohttp-сессию", exc_info=True)
 
     def update_proxies(self, proxies: List[str]):
         self.proxy_pool = list(proxies)
@@ -235,7 +253,7 @@ class ChangePaymentClient:
         max_proxy_attempts: int = 3,
         timeout: float = 15.0,
     ) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
-        assert self._session is not None, "Сначала вызови start()"
+        session = await self._get_or_create_session()
 
         attempts = max_proxy_attempts if (use_proxies and self.proxy_pool) else 1
         last_exc = None
@@ -246,7 +264,7 @@ class ChangePaymentClient:
             used_proxy = proxy
 
             try:
-                async with self._session.post(
+                async with session.post(
                     self.base_url,
                     json=payload,
                     headers=headers,
@@ -272,6 +290,7 @@ class SessionService:
         payload: dict,
         session_id: str,
         use_proxies: bool,
+        platform: str = "tg",
         max_attempts: int = 3,
     ) -> Tuple[bool, Optional[int], Optional[str]]:
         await self.client.start()
@@ -303,6 +322,7 @@ class SessionService:
             status_code=status_code,
             response_body=response_text,
             session_id=session_id,
+            platform=platform,
         )
 
         return ok, status_code, response_text
@@ -316,6 +336,7 @@ class SessionService:
         total_requests: int,
         concurrency: int,
         session_id: str,
+        platform: str = "tg",
         progress_cb: Optional[
             Callable[[int, int, int, Optional[str]], Awaitable[None]]
         ] = None,
@@ -343,7 +364,7 @@ class SessionService:
 
                 try:
                     ok, status_code, response_text = await self.send_one(
-                        tg_id, headers, payload, session_id, use_proxies
+                        tg_id, headers, payload, session_id, use_proxies, platform
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.exception("Ошибка при отправке в потоке %s: %s", worker_id, e)
@@ -441,6 +462,7 @@ def init_db():
             body TEXT NOT NULL,
             status_code INTEGER,
             response_body TEXT,
+            platform TEXT DEFAULT 'tg',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
@@ -450,6 +472,13 @@ def init_db():
         cur.execute("ALTER TABLE requests ADD COLUMN session_id TEXT;")
     except sqlite3.OperationalError:
         pass  # уже есть
+
+    try:
+        cur.execute("ALTER TABLE requests ADD COLUMN platform TEXT DEFAULT 'tg';")
+    except sqlite3.OperationalError:
+        pass  # уже есть
+
+    cur.execute("UPDATE requests SET platform = COALESCE(platform, 'tg');")
 
     cur.execute(
         """
@@ -463,6 +492,7 @@ def init_db():
             orderid TEXT,
             trip_link TEXT,
             session_id TEXT,
+            platform TEXT DEFAULT 'tg',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
@@ -477,6 +507,13 @@ def init_db():
         cur.execute("ALTER TABLE trip_templates ADD COLUMN trip_name TEXT;")
     except sqlite3.OperationalError:
         pass  # уже есть
+
+    try:
+        cur.execute("ALTER TABLE trip_templates ADD COLUMN platform TEXT DEFAULT 'tg';")
+    except sqlite3.OperationalError:
+        pass  # уже есть
+
+    cur.execute("UPDATE trip_templates SET platform = COALESCE(platform, 'tg');")
 
     cur.execute(
         """
@@ -506,14 +543,15 @@ def log_request_to_db(
     status_code: Optional[int],
     response_body: Optional[str],
     session_id: str,
+    platform: str = "tg",
 ):
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute(
         """
-        INSERT INTO requests (tg_id, url, method, headers, body, status_code, response_body, session_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO requests (tg_id, url, method, headers, body, status_code, response_body, session_id, platform)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             tg_id,
@@ -524,6 +562,7 @@ def log_request_to_db(
             status_code,
             response_body,
             session_id,
+            platform,
         ),
     )
 
@@ -588,23 +627,26 @@ def is_user_verified(tg_id: int) -> bool:
     return bool(row and row[0])
 
 
-def get_request_count_for_user(tg_id: int) -> int:
+def get_request_count_for_user(tg_id: int, platform: str = "tg") -> int:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM requests WHERE tg_id = ?;", (tg_id,))
+    cur.execute(
+        "SELECT COUNT(*) FROM requests WHERE tg_id = ? AND platform = ?;",
+        (tg_id, platform),
+    )
     (count,) = cur.fetchone()
     conn.close()
     return count or 0
 
 
-def create_trip_template(tg_id: int) -> int:
+def create_trip_template(tg_id: int, platform: str = "tg") -> int:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO trip_templates (tg_id) VALUES (?);
+        INSERT INTO trip_templates (tg_id, platform) VALUES (?, ?);
         """,
-        (tg_id,),
+        (tg_id, platform),
     )
     trip_id = cur.lastrowid
     conn.commit()
@@ -612,17 +654,17 @@ def create_trip_template(tg_id: int) -> int:
     return trip_id
 
 
-def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
+def get_trip_template(trip_id: int, tg_id: int, platform: str = "tg") -> Optional[dict]:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, session_id
         FROM trip_templates
-        WHERE id = ? AND tg_id = ?
+        WHERE id = ? AND tg_id = ? AND platform = ?
         LIMIT 1;
         """,
-        (trip_id, tg_id),
+        (trip_id, tg_id, platform),
     )
     row = cur.fetchone()
     conn.close()
@@ -641,7 +683,9 @@ def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
     return None
 
 
-def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str) -> None:
+def update_trip_template_field(
+    trip_id: int, tg_id: int, field: str, value: str, *, platform: str = "tg"
+) -> None:
     if field not in {
         "trip_name",
         "token2",
@@ -655,31 +699,31 @@ def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        f"UPDATE trip_templates SET {field} = ? WHERE id = ? AND tg_id = ?;",
-        (value, trip_id, tg_id),
+        f"UPDATE trip_templates SET {field} = ? WHERE id = ? AND tg_id = ? AND platform = ?;",
+        (value, trip_id, tg_id, platform),
     )
 
     if field == "token2":
         cur.execute(
-            "UPDATE trip_templates SET session_id = NULL WHERE id = ? AND tg_id = ?;",
-            (trip_id, tg_id),
+            "UPDATE trip_templates SET session_id = NULL WHERE id = ? AND tg_id = ? AND platform = ?;",
+            (trip_id, tg_id, platform),
         )
     elif field == "session_id":
         cur.execute(
-            "UPDATE trip_templates SET token2 = NULL WHERE id = ? AND tg_id = ?;",
-            (trip_id, tg_id),
+            "UPDATE trip_templates SET token2 = NULL WHERE id = ? AND tg_id = ? AND platform = ?;",
+            (trip_id, tg_id, platform),
         )
 
     conn.commit()
     conn.close()
 
 
-def find_trip_template_by_token2(tg_id: int, token2: str) -> Optional[int]:
+def find_trip_template_by_token2(tg_id: int, token2: str, platform: str = "tg") -> Optional[int]:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id FROM trip_templates WHERE tg_id = ? AND token2 = ? LIMIT 1;",
-        (tg_id, token2),
+        "SELECT id FROM trip_templates WHERE tg_id = ? AND token2 = ? AND platform = ? LIMIT 1;",
+        (tg_id, token2, platform),
     )
     row = cur.fetchone()
     conn.close()
@@ -687,34 +731,38 @@ def find_trip_template_by_token2(tg_id: int, token2: str) -> Optional[int]:
 
 
 def ensure_trip_from_token2(
-    tg_id: int, token2: str, trip_id: Optional[str], card: Optional[str]
+    tg_id: int,
+    token2: str,
+    trip_id: Optional[str],
+    card: Optional[str],
+    platform: str = "tg",
 ) -> int:
-    trip_db_id = find_trip_template_by_token2(tg_id, token2)
+    trip_db_id = find_trip_template_by_token2(tg_id, token2, platform)
     if trip_db_id is None:
-        trip_db_id = create_trip_template(tg_id)
+        trip_db_id = create_trip_template(tg_id, platform)
 
-    update_trip_template_field(trip_db_id, tg_id, "trip_name", token2)
-    update_trip_template_field(trip_db_id, tg_id, "token2", token2)
+    update_trip_template_field(trip_db_id, tg_id, "trip_name", token2, platform=platform)
+    update_trip_template_field(trip_db_id, tg_id, "token2", token2, platform=platform)
 
     if trip_id:
-        update_trip_template_field(trip_db_id, tg_id, "trip_id", trip_id)
+        update_trip_template_field(trip_db_id, tg_id, "trip_id", trip_id, platform=platform)
     if card:
-        update_trip_template_field(trip_db_id, tg_id, "card", card)
+        update_trip_template_field(trip_db_id, tg_id, "card", card, platform=platform)
 
     return trip_db_id
 
 
-def list_trip_templates(tg_id: int) -> List[dict]:
+def list_trip_templates(tg_id: int, platform: str = "tg") -> List[dict]:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, session_id, created_at
         FROM trip_templates
-        WHERE tg_id = ?
+        WHERE tg_id = ? AND platform = ?
         ORDER BY id DESC;
         """,
-        (tg_id,),
+        (tg_id, platform),
     )
     rows = cur.fetchall()
     conn.close()
@@ -732,10 +780,13 @@ def list_trip_templates(tg_id: int) -> List[dict]:
     return [dict(zip(keys, row)) for row in rows]
 
 
-def delete_trip_template(trip_id: int, tg_id: int) -> None:
+def delete_trip_template(trip_id: int, tg_id: int, platform: str = "tg") -> None:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM trip_templates WHERE id = ? AND tg_id = ?;", (trip_id, tg_id))
+    cur.execute(
+        "DELETE FROM trip_templates WHERE id = ? AND tg_id = ? AND platform = ?;",
+        (trip_id, tg_id, platform),
+    )
     conn.commit()
     conn.close()
 
@@ -803,7 +854,7 @@ def fetch_mike_order_by_id(row_id: int) -> Optional[dict]:
         return None
 
 
-def clear_trip_template(trip_id: int, tg_id: int) -> None:
+def clear_trip_template(trip_id: int, tg_id: int, platform: str = "tg") -> None:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -816,9 +867,9 @@ def clear_trip_template(trip_id: int, tg_id: int) -> None:
             orderid = NULL,
             trip_link = NULL,
             session_id = NULL
-        WHERE id = ? AND tg_id = ?;
+        WHERE id = ? AND tg_id = ? AND platform = ?;
         """,
-        (trip_id, tg_id),
+        (trip_id, tg_id, platform),
     )
     conn.commit()
     conn.close()
@@ -849,7 +900,7 @@ def import_mike_order_to_trip(order: dict, tg_id: int) -> Optional[int]:
     return trip_db_id
 
 
-def export_session_logs_to_file(tg_id: int, session_id: str) -> Optional[str]:
+def export_session_logs_to_file(tg_id: int, session_id: str, platform: str = "tg") -> Optional[str]:
 
     conn = get_conn()
     cur = conn.cursor()
@@ -857,10 +908,10 @@ def export_session_logs_to_file(tg_id: int, session_id: str) -> Optional[str]:
         """
         SELECT id, created_at, status_code, response_body
         FROM requests
-        WHERE tg_id = ? AND session_id = ?
+        WHERE tg_id = ? AND session_id = ? AND platform = ?
         ORDER BY id;
         """,
-        (tg_id, session_id),
+        (tg_id, session_id, platform),
     )
     rows = cur.fetchall()
     conn.close()
@@ -1375,9 +1426,10 @@ async def do_single_request_and_log(
     payload: dict,
     session_id: str,
     use_proxies: bool,
+    platform: str = "tg",
 ) -> Tuple[bool, Optional[int], Optional[str]]:
     return await session_service.send_one(
-        tg_id, headers, payload, session_id, use_proxies
+        tg_id, headers, payload, session_id, use_proxies, platform
     )
 
 
