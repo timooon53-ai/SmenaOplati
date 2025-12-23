@@ -9,7 +9,6 @@ from typing import Iterable
 import vk_api
 from vk_api.longpoll import VkEventType, VkLongPoll
 
-os.environ.setdefault("BOT_DB_PATH", "VD.db")
 from cfg import VK_TOKEN
 from main import (
     build_headers,
