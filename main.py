@@ -1500,6 +1500,95 @@ def _field_icon(value: Optional[str]) -> str:
     return "✅" if value else "⬜"
 
 
+ORDER_ACTION_RESPONSES = {
+    "car_found": "✅ Отметил: машина нашлась. Спасибо за подтверждение!",
+    "cancel_search": "🛑 Поиск отменён. Если нужно, отправь новый заказ.",
+}
+
+
+def _normalize_order_action(raw_value: Optional[str]) -> Optional[str]:
+    if not raw_value:
+        return None
+    normalized = raw_value.strip().lower()
+
+    if normalized in {"car_found", "found_car", "машина_нашлась"}:
+        return "car_found"
+    if normalized in {"cancel_search", "search_cancel", "отменить_поиск"}:
+        return "cancel_search"
+
+    if normalized.startswith("order:"):
+        parts = normalized.split(":", 1)
+        return _normalize_order_action(parts[1])
+
+    if normalized.startswith("нашлась машина"):
+        return "car_found"
+    if normalized.startswith("отменить поиск"):
+        return "cancel_search"
+
+    return None
+
+
+async def _handle_order_action(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source: str,
+    raw_value: Optional[str],
+):
+    action = _normalize_order_action(raw_value)
+    if not action:
+        return False
+
+    response_text = ORDER_ACTION_RESPONSES.get(action, "Принял действие.")
+
+    if source == "callback":
+        query = update.callback_query
+        if query:
+            await query.answer()
+            message = query.message
+            if message:
+                try:
+                    await message.edit_reply_markup(reply_markup=None)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Не смог убрать клавиатуру у сообщения: %s", exc)
+            await safe_reply(update, context, response_text, reply_markup=main_keyboard())
+            return True
+
+    if source == "text":
+        await safe_reply(update, context, response_text, reply_markup=main_keyboard())
+        return True
+
+    return False
+
+
+async def order_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    raw_value = query.data if query else None
+    handled = await _handle_order_action(
+        update=update,
+        context=context,
+        source="callback",
+        raw_value=raw_value,
+    )
+    if not handled and query:
+        await query.answer()
+        await query.message.reply_text(
+            "Не понял действие. Проверь, что кнопка актуальна.",
+            reply_markup=main_keyboard(),
+        )
+    return MENU
+
+
+async def order_action_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _handle_order_action(
+        update=update,
+        context=context,
+        source="text",
+        raw_value=update.message.text if update.message else None,
+    )
+    return MENU
+
+
 def ensure_active_trip_record(tg_id: int, context: ContextTypes.DEFAULT_TYPE) -> dict:
     trip_id = context.user_data.get("active_trip_id")
     record = None
@@ -3219,6 +3308,18 @@ def build_application() -> "Application":
     app = ApplicationBuilder().bot(bot).build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("request", request_restart))
+    app.add_handler(
+        CallbackQueryHandler(
+            order_action_callback,
+            pattern=r"(?i)^(?:order:)?(?:car_found|found_car|cancel_search|search_cancel|машина_нашлась|нашлась машина.*|отменить поиск.*)$",
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"(?i)^(?:нашлась машина|отменить поиск).*$"),
+            order_action_text_handler,
+        )
+    )
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
